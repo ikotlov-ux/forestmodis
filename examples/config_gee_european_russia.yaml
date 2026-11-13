@@ -1,0 +1,85 @@
+# ForestMODIS — Европейская территория России, бэкенд Google Earth Engine.
+# Гранулы NASA не скачиваются: сезонные слои готовит Earth Engine,
+# на компьютер приходят только готовые годовые растры (единицы ГБ).
+# Скопируйте в папку проекта как config.yaml и положите полигон в inputs/aoi.gpkg
+# (подходит examples/aoi_european_russia.gpkg).
+project:
+  name: european_russia_gee
+  root: .
+  random_seed: 42
+
+inputs:
+  aoi: inputs/aoi.gpkg
+  zones: null
+  zones_field: null
+  validation: null
+  buffer_km: 0
+
+period:
+  start_year: 2003
+  end_year: 2024
+  comparison_baseline: [2003, 2005]
+  anomaly_baseline: [2003, 2012]
+
+seasons:
+  growing: ["05-01", "09-30"]
+  summer: ["06-01", "08-31"]
+
+grid:
+  resolution_m: 500
+  crs: auto_albers
+
+data:
+  backend: gee
+  mode: online
+  collection_version: "061"
+  fail_on_missing_required: true
+  # Проект Google Cloud, зарегистрированный в Earth Engine
+  # (code.earthengine.google.com → Project info → Cloud Project)
+  gee_project: steel-capsule-438113-h8
+  # annual: годовой GPP MOD17A3HGF на весь период 2003-2024
+  # growing: сезонный GPP MOD17A2HGF (в GEE есть только с 2021 г.)
+  gee_gpp: annual
+  gee_workers: 4
+  products: [MCD12Q1, MOD44B, MOD13Q1, MYD13Q1, MCD15A2H, MOD17A2HGF,
+             MOD16A2GF, MOD11A2, MYD11A2, MCD64A1]
+
+quality:
+  profile: standard
+  min_season_coverage: 0.5
+  min_window_valid_fraction: 0.95
+  interpolate: false
+
+landcover:
+  classes: [1, 3, 4, 5, 8, 9]
+  persistence_before: 3
+  persistence_after: 3
+
+treecover:
+  primary_threshold_pct: 30
+  sensitivity_thresholds_pct: [10, 20, 30, 40, 50, 60]
+
+fragmentation:
+  main_window_km: 25
+  sensitivity_windows_km: [10, 50]
+  neighborhood: 8
+  edge_depth_cells: 1
+  count_outer_boundary_in_ed: false
+
+statistics:
+  min_valid_years: 15
+  alpha: 0.05
+
+lst:
+  role: explanatory
+
+vulnerability:
+  status: provisional
+  scenario_id: provisional_v1
+
+reporting:
+  reference_years: [2004, 2009, 2014, 2019, 2024]
+
+execution:
+  workers: 4
+  block_rows: 256

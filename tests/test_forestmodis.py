@@ -9,6 +9,8 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import copy
+
 import forestmodis as fm  # noqa: E402
 
 
@@ -241,3 +243,119 @@ def test_geo_mean():
 def test_config_validation():
     cfg = fm.load_config(None)
     assert isinstance(fm.validate_config(cfg), list)
+
+
+# ============================ GEE-бэкенд ==================================
+class _FakeEE:
+    def __init__(self, *_a, **_k):
+        pass
+
+    def __getattr__(self, k):
+        if k.startswith("__") and k.endswith("__"):
+            raise AttributeError(k)
+        return _FakeEE()
+
+    def __call__(self, *_a, **_k):
+        return _FakeEE()
+
+
+def _fake_ee():
+    import types
+    m = types.ModuleType("ee")
+    for n in ("Image", "ImageCollection", "Reducer", "Geometry",
+              "Projection", "Algorithms"):
+        setattr(m, n, _FakeEE())
+    return m
+
+
+def test_gee_blocks_fit_limit_and_cover_grid():
+    import forestmodis as f
+    g = f.Grid(crs="EPSG:4326", transform=(500, 0, 0, 0, -500, 0),
+               width=5327, height=6930, res=500,
+               aoi_mask=np.zeros((6930, 5327), bool), zones=None,
+               zone_names={})
+    for nb in (1, 6, 12):
+        blocks = f.gee_blocks(g, nb, max_mb=40)
+        covered = sum(r1 - r0 for r0, r1, _, _ in blocks)
+        assert covered == g.height
+        assert all(c1 - c0 == g.width for _, _, c0, c1 in blocks)
+        for r0, r1, c0, c1 in blocks:
+            nbytes = (r1 - r0) * (c1 - c0) * nb * 4
+            assert nbytes <= 40 * 1024 * 1024, nbytes
+
+
+def test_gee_assets_cover_all_products():
+    import forestmodis as f
+    layers = {"MCD12Q1": ["LC_Type1"], "MOD44B": ["Percent_Tree_Cover"],
+              "MOD13Q1": ["250m 16 days EVI", "250m 16 days NDVI",
+                          "250m 16 days pixel reliability",
+                          "250m 16 days composite day of the year"],
+              "MYD13Q1": ["250m 16 days EVI"],
+              "MCD15A2H": ["Lai_500m", "Fpar_500m", "FparLai_QC"],
+              "MOD17A2HGF": ["Gpp_500m", "Psn_QC_500m"],
+              "MOD16A2GF": ["ET_500m", "PET_500m", "ET_QC_500m"],
+              "MOD11A2": ["LST_Day_1km", "LST_Night_1km", "QC_Day",
+                          "QC_Night"],
+              "MYD11A2": ["LST_Day_1km", "LST_Night_1km"],
+              "MCD64A1": ["Burn Date", "QA"]}
+    for prod, ls in layers.items():
+        assert prod in f.GEE_ASSETS, prod
+        for l in ls:
+            assert l in f.GEE_ASSETS[prod]["bands"], (prod, l)
+
+
+def test_gee_state_stats_band_names():
+    import forestmodis as f
+    import sys
+    sys.modules["ee"] = _fake_ee()
+    try:
+        cfg = copy.deepcopy(f.DEFAULT_CONFIG)
+        ls = [("250m 16 days EVI", "evi_terra"),
+              ("250m 16 days NDVI", "ndvi_terra")]
+        r = f.gee_state_stats(cfg, "MOD13Q1", 2003, "growing", ls,
+                              use_pixel_doy="250m 16 days composite day "
+                              "of the year")
+    finally:
+        del sys.modules["ee"]
+    assert r is not None
+    _, specs, n_exp = r
+    names = [b for b, _, _ in specs]
+    for pref in ("evi_terra", "ndvi_terra"):
+        for k in ("mean", "median", "max", "p10", "p90", "coverage"):
+            assert f"{pref}_growing_{k}" in names, names
+    assert n_exp == 11          # композиты MOD13, пересекающие сезон 05-01..09-30
+
+
+def test_gee_accumulated_band_names():
+    import forestmodis as f
+    import sys
+    sys.modules["ee"] = _fake_ee()
+    try:
+        cfg = copy.deepcopy(f.DEFAULT_CONFIG)
+        r = f.gee_accumulated(cfg, "MOD16A2GF", 2010, "growing",
+                              [("ET_500m", "et"), ("PET_500m", "pet")])
+    finally:
+        del sys.modules["ee"]
+    assert r is not None
+    _, specs, n_exp = r
+    names = [b for b, _, _ in specs]
+    assert "et_growing_sum" in names and "pet_growing_sum" in names
+    assert "et_growing_coverage" in names and "pet_growing_coverage" in names
+    assert "etpet_growing_ratio" in names
+    assert n_exp > 0
+
+
+def test_validate_config_gee():
+    import forestmodis as f
+    cfg = copy.deepcopy(f.DEFAULT_CONFIG)
+    cfg["data"]["backend"] = "gee"
+    cfg["data"]["gee_gpp"] = "wrong"
+    with pytest.raises(f.ConfigError):
+        f.validate_config(cfg)
+    cfg["data"]["gee_gpp"] = "annual"
+    cfg["data"]["gee_project"] = "test-project"
+    w = f.validate_config(cfg)
+    assert not any("gee_project" in x for x in w)
+    cfg["data"]["products"] = ["MCD12Q1", "BADPROD"]
+    with pytest.raises(f.ConfigError):
+        f.validate_config(cfg)

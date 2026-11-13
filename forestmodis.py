@@ -309,7 +309,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
              # Cloud) или laads (LAADS DAAC; нужен токен Earthdata)
              "source": "auto",
              "laads_url": "https://ladsweb.modaps.eosdis.nasa.gov",
-             "search_workers": 6},
+             "search_workers": 6,
+             # GEE-бэкенд: те же продукты MODIS C6.1 без скачивания гранул
+             "gee_project": None,     # проект Google Cloud (Earth Engine)
+             "gee_gpp": "annual",     # annual (MOD17A3HGF, 2003-2024) | growing
+             "gee_workers": 4},
     "quality": {"profile": "standard", "min_season_coverage": 0.5,
                 "min_window_valid_fraction": 0.95, "interpolate": False},
     "landcover": {"classes": [1, 3, 4, 5, 8, 9],
@@ -452,6 +456,17 @@ def validate_config(cfg: dict) -> List[str]:
         if prod not in cfg["data"]["products"]:
             warn.append(f"Продукт {prod} исключён: зависимые этапы будут "
                         "пропущены.")
+    if cfg["data"].get("backend") == "gee":
+        if cfg["data"].get("gee_gpp") not in (None, "annual", "growing"):
+            raise ConfigError("data.gee_gpp: annual | growing")
+        if not (cfg["data"].get("gee_project")
+                or os.environ.get("EE_PROJECT")
+                or os.environ.get("GOOGLE_CLOUD_PROJECT")):
+            warn.append("backend=gee: не задан data.gee_project — будет "
+                        "использован проект из настроек earthengine.")
+        for prod in cfg["data"]["products"]:
+            if prod not in GEE_ASSETS:
+                raise ConfigError(f"продукт {prod} недоступен в Earth Engine")
     return warn
 
 
@@ -2176,6 +2191,666 @@ def stage_prepare(prj: Project):
 
 
 # =============================================================================
+# 11b. GEE-бэкенд: те же годовые слои из Google Earth Engine, без гранул
+# =============================================================================
+# Каталог GEE: https://developers.google.com/earth-engine/datasets
+# MCD15A2H в каталоге нет — используется MCD15A3H (4-дневный, Terra+Aqua,
+# с 2002-07). MOD17A2HGF (8-дневный GPP) в GEE есть только с 2021 г., поэтому
+# по умолчанию годовой GPP берётся из MOD17A3HGF (2001+, gee_gpp: annual).
+GEE_ASSETS: Dict[str, Dict[str, Any]] = {
+    "MCD12Q1": dict(asset="MODIS/061/MCD12Q1",
+                    bands={"LC_Type1": "LC_Type1", "QC": "QC"}),
+    "MOD44B": dict(asset="MODIS/061/MOD44B",
+                   bands={"Percent_Tree_Cover": "Percent_Tree_Cover",
+                          "Quality": "Quality"}),
+    "MOD13Q1": dict(asset="MODIS/061/MOD13Q1",
+                    bands={"250m 16 days EVI": "EVI",
+                           "250m 16 days NDVI": "NDVI",
+                           "250m 16 days pixel reliability": "SummaryQA",
+                           "250m 16 days composite day of the year":
+                               "DayOfYear"}),
+    "MYD13Q1": dict(asset="MODIS/061/MYD13Q1",
+                    bands={"250m 16 days EVI": "EVI",
+                           "250m 16 days NDVI": "NDVI",
+                           "250m 16 days pixel reliability": "SummaryQA",
+                           "250m 16 days composite day of the year":
+                               "DayOfYear"}),
+    "MCD15A2H": dict(asset="MODIS/061/MCD15A3H", cadence=4,
+                     bands={"Lai_500m": "Lai", "Fpar_500m": "Fpar",
+                            "FparLai_QC": "FparLai_QC"}),
+    "MOD17A2HGF": dict(asset="MODIS/061/MOD17A2HGF",
+                       bands={"Gpp_500m": "Gpp",
+                              "Psn_QC_500m": "Psn_QC"}),
+    "MOD17A3HGF": dict(asset="MODIS/061/MOD17A3HGF", bands={"Gpp": "Gpp"}),
+    "MOD16A2GF": dict(asset="MODIS/061/MOD16A2GF",
+                      bands={"ET_500m": "ET", "PET_500m": "PET",
+                             "ET_QC_500m": "ET_QC"}),
+    "MOD11A2": dict(asset="MODIS/061/MOD11A2",
+                    bands={"LST_Day_1km": "LST_Day_1km",
+                           "LST_Night_1km": "LST_Night_1km",
+                           "QC_Day": "QC_Day", "QC_Night": "QC_Night"}),
+    "MYD11A2": dict(asset="MODIS/061/MYD11A2",
+                    bands={"LST_Day_1km": "LST_Day_1km",
+                           "LST_Night_1km": "LST_Night_1km",
+                           "QC_Day": "QC_Day", "QC_Night": "QC_Night"}),
+    "MCD64A1": dict(asset="MODIS/061/MCD64A1",
+                    bands={"Burn Date": "BurnDate", "QA": "QA"}),
+}
+GEE_250M = {"MOD13Q1", "MYD13Q1", "MOD44B"}   # усреднение 250 → 500 м
+GEE_SENTINEL = -9999.0                         # пропуск при скачивании
+
+
+def gee_init(cfg):
+    """Подключение к Earth Engine. Проект: data.gee_project, EE_PROJECT или
+    настройки earthengine. При первом запуске откроется вход Google."""
+    try:
+        import ee
+    except ImportError:
+        raise RuntimeError("Для backend=gee установите earthengine-api: "
+                           "pip install earthengine-api")
+    project = (cfg["data"].get("gee_project")
+               or os.environ.get("EE_PROJECT")
+               or os.environ.get("GOOGLE_CLOUD_PROJECT") or None)
+    try:
+        ee.Initialize(project=project) if project else ee.Initialize()
+        return ee
+    except Exception:
+        pass
+    try:
+        ee.Authenticate()
+        ee.Initialize(project=project) if project else ee.Initialize()
+        return ee
+    except Exception as e:
+        raise RuntimeError(
+            f"Не удалось подключиться к Earth Engine: {e}. Выполните в "
+            "терминале `earthengine authenticate` и укажите проект в "
+            "config.yaml (data.gee_project).")
+
+
+def _gee_in(img, values):
+    import ee
+    m = ee.Image(0)
+    for v in values:
+        m = m.Or(img.eq(v))
+    return m
+
+
+def _gee_scf_cloud(qc, profile, sets):
+    scf = qc.rightShift(5).bitwiseAnd(7)
+    m = _gee_in(scf, sets[profile])
+    if profile == "strict":
+        m = m.And(_gee_in(qc.rightShift(3).bitwiseAnd(3), [0, 3]))
+    return m
+
+
+def gee_qa_mask(prod, img, profile, layer=None):
+    """QA-маска (1 = пиксель принимается) — те же правила, что при загрузке
+    гранул. None — QA для продукта не применяется."""
+    if prod == "MCD12Q1":
+        allowed = {"strict": [0], "standard": [0, 8, 9],
+                   "relaxed": [0, 5, 7, 8, 9]}[profile]
+        return _gee_in(img.select("QC"), allowed)
+    if prod in ("MOD13Q1", "MYD13Q1"):
+        allowed = {"strict": [0], "standard": [0, 1],
+                   "relaxed": [0, 1, 2]}[profile]
+        return _gee_in(img.select("SummaryQA"), allowed)
+    if prod == "MCD15A2H":
+        return _gee_scf_cloud(img.select("FparLai_QC"), profile,
+                              {"strict": [0], "standard": [0, 1],
+                               "relaxed": [0, 1, 2, 3]})
+    if prod == "MOD17A2HGF":
+        if profile == "relaxed":
+            return None
+        return _gee_scf_cloud(img.select("Psn_QC"), profile,
+                              {"strict": [0, 1], "standard": [0, 1, 2, 3]})
+    if prod == "MOD16A2GF":
+        if profile == "relaxed":
+            return None
+        return _gee_scf_cloud(img.select("ET_QC"), profile,
+                              {"strict": [0, 1], "standard": [0, 1, 2, 3]})
+    if prod in ("MOD11A2", "MYD11A2"):
+        qc = img.select("QC_Day" if layer == "LST_Day_1km" else "QC_Night")
+        mand = qc.bitwiseAnd(3)
+        if profile == "strict":
+            return mand.eq(0)
+        m = _gee_in(mand, [0, 1])
+        if profile == "standard":
+            m = m.And(qc.rightShift(6).bitwiseAnd(3).lte(1))
+        return m
+    if prod == "MCD64A1":
+        qa = img.select("QA")
+        m = qa.bitwiseAnd(1).eq(1).And(
+            qa.rightShift(1).bitwiseAnd(1).eq(1))
+        if profile == "strict":
+            m = m.And(qa.rightShift(2).bitwiseAnd(1).eq(0))
+        return m
+    if prod == "MOD44B":
+        if profile == "strict":
+            return img.select("Quality").eq(0)
+        return None
+    return None
+
+
+def gee_cadence(prod: str):
+    return GEE_ASSETS[prod].get("cadence", PRODUCTS[prod]["cadence"])
+
+
+def gee_composite_starts(prod: str, year: int) -> List[int]:
+    cad = gee_cadence(prod)
+    if isinstance(cad, str):          # annual | monthly — как в реестре
+        return composite_starts(prod, year)
+    return list(range(PRODUCTS[prod]["start_doy"], year_len(year) + 1, cad))
+
+
+def gee_composite_interval(prod: str, year: int, st: int) -> Tuple[int, int]:
+    cad = gee_cadence(prod)
+    if isinstance(cad, str):
+        return composite_interval(prod, year, st)
+    return st, min(st + cad - 1, year_len(year))
+
+
+def gee_needed_composites(cfg, prod: str, year: int) -> List[int]:
+    cad = gee_cadence(prod)
+    if isinstance(cad, str):
+        return composite_starts(prod, year)
+    s0 = min(md_to_doy(year, cfg["seasons"][k][0]) for k in cfg["seasons"])
+    s1 = max(md_to_doy(year, cfg["seasons"][k][1]) for k in cfg["seasons"])
+    out = []
+    for st in gee_composite_starts(prod, year):
+        a, b = gee_composite_interval(prod, year, st)
+        if b >= s0 and a <= s1:
+            out.append(st)
+    return out
+
+
+def _gee_empty(bands):
+    import ee
+    im = None
+    for b in bands:
+        c = ee.Image(0).mask(0).rename(b)
+        im = c if im is None else im.addBands(c)
+    return im
+
+
+def gee_composite(prod, year, a, b):
+    """Изображение GEE на интервал дней [a, b]; пустое (замаскированное),
+    если данных за интервал нет."""
+    import ee
+    g = GEE_ASSETS[prod]
+    d0 = (dt.date(year, 1, 1) + dt.timedelta(days=a - 1)).isoformat()
+    d1 = (dt.date(year, 1, 1) + dt.timedelta(days=b)).isoformat()
+    col = ee.ImageCollection(g["asset"]).filterDate(d0, d1)
+    empty = _gee_empty(list(g["bands"].values()))
+    return ee.Image(ee.Algorithms.If(col.size().gt(0), col.first(), empty))
+
+
+def gee_layer(prod, img, layer, profile):
+    """Слой в физических единицах с QA-маской (брак скрыт маской)."""
+    spec = PRODUCTS[prod]["layers"][layer]
+    raw = img.select(GEE_ASSETS[prod]["bands"][layer])
+    lo, hi = spec.get("valid", (-1e9, 1e9))
+    m = raw.gte(lo).And(raw.lte(hi))
+    if spec.get("fill") is not None:
+        m = m.And(raw.neq(spec["fill"]))
+    qm = gee_qa_mask(prod, img, profile, layer=layer)
+    if qm is not None:
+        m = m.And(qm)
+    if spec["kind"] in ("categorical", "doy", "event", "qa"):
+        return raw.updateMask(m)
+    return raw.multiply(spec.get("scale", 1.0)).add(
+        spec.get("offset", 0.0)).updateMask(m)
+
+
+def gee_to_grid(prod, img, layer):
+    """Приведение к сетке 500 м: mean для 250 м продуктов, bilinear для 1 км
+    и непрерывных 500 м (соответствует average при загрузке гранул)."""
+    import ee
+    if PRODUCTS[prod]["layers"][layer]["kind"] in ("categorical", "doy",
+                                                   "event"):
+        return img                       # nearest (по умолчанию)
+    if prod in GEE_250M:
+        return img.reduceResolution(ee.Reducer.mean(), maxPixels=1024)
+    return img.resample("bilinear")
+
+
+def gee_season_composites(cfg, prod, year, season_key, use_pixel_doy=None):
+    """Композиты сезона по правилам отбора needed_composites и с теми же
+    весами ov/ln, что при загрузке гранул. [(img, w, ov, ln), ...]"""
+    season = cfg["seasons"][season_key]
+    out = []
+    for st in gee_needed_composites(cfg, prod, year):
+        a, b = gee_composite_interval(prod, year, st)
+        ov, ln = season_overlap(year, a, b, season)
+        if ov == 0:
+            continue
+        if use_pixel_doy is None and ov < ln / 2:
+            continue
+        out.append((gee_composite(prod, year, a, b), ov / ln, ov, ln))
+    return out
+
+
+def gee_state_stats(cfg, prod, year, season_key, layer_specs,
+                    use_pixel_doy=None):
+    """Сезонные статистики (mean/median/max/p10/p90/coverage) слоёв состояния
+    (EVI, NDVI, LAI, FPAR, LST). layer_specs: [(local_layer, out_prefix)].
+    Возвращает (ee.Image, [(band, layer, stat)], n_expected) или None."""
+    import ee
+    comps = gee_season_composites(cfg, prod, year, season_key, use_pixel_doy)
+    if not comps:
+        return None
+    season = cfg["seasons"][season_key]
+    s0, s1 = md_to_doy(year, season[0]), md_to_doy(year, season[1])
+    profile = cfg["quality"]["profile"]
+    stacks: Dict[str, list] = {p: [] for _, p in layer_specs}
+    for img, w, ov, ln in comps:
+        pix = None
+        if use_pixel_doy:
+            doy = img.select(GEE_ASSETS[prod]["bands"][use_pixel_doy])
+            pix = doy.gte(s0).And(doy.lte(s1))
+        for layer, pref in layer_specs:
+            v = gee_layer(prod, img, layer, profile)
+            if pix is not None:
+                v = v.updateMask(pix)
+            stacks[pref].append(gee_to_grid(prod, v, layer))
+    mincov = cfg["quality"]["min_season_coverage"]
+    out, specs = None, []
+    for layer, pref in layer_specs:
+        col = ee.ImageCollection.fromImages(stacks[pref])
+        cov = col.count().divide(float(len(comps)))
+        ok = cov.gte(mincov)
+        for k, im in (("mean", col.mean()), ("median", col.median()),
+                      ("max", col.max()),
+                      ("p10", col.reduce(ee.Reducer.percentile([10]))),
+                      ("p90", col.reduce(ee.Reducer.percentile([90])))):
+            im = im.updateMask(ok).rename(f"{pref}_{season_key}_{k}")
+            out = im if out is None else out.addBands(im)
+            specs.append((f"{pref}_{season_key}_{k}", layer, k))
+        covb = cov.rename(f"{pref}_{season_key}_coverage")
+        out = covb if out is None else out.addBands(covb)
+        specs.append((f"{pref}_{season_key}_coverage", layer, "coverage"))
+    return out, specs, len(comps)
+
+
+def gee_accumulated(cfg, prod, year, season_key, layers):
+    """Сезонные суммы накопленных величин (GPP/ET/PET) с весами ov/ln и
+    ET/PET по общим валидным интервалам (как prepare_accumulated).
+    layers: [(local_layer, out_prefix)]."""
+    import ee
+    comps = gee_season_composites(cfg, prod, year, season_key)
+    if not comps:
+        return None
+    season = cfg["seasons"][season_key]
+    s_days = md_to_doy(year, season[1]) - md_to_doy(year, season[0]) + 1
+    profile = cfg["quality"]["profile"]
+    layer_map = dict(layers)
+    sums = {p: [] for p in layer_map.values()}
+    days = {p: [] for p in layer_map.values()}
+    cet, cpet = [], []
+    for img, w, ov, ln in comps:
+        vals = {}
+        for layer in layer_map:
+            v = gee_to_grid(prod, gee_layer(prod, img, layer, profile), layer)
+            vals[layer] = v
+            p = layer_map[layer]
+            sums[p].append(v.multiply(w))
+            days[p].append(v.mask().multiply(ov))
+        if "ET_500m" in vals and "PET_500m" in vals:
+            both = vals["ET_500m"].mask().And(vals["PET_500m"].mask())
+            cet.append(vals["ET_500m"].updateMask(both).multiply(w))
+            cpet.append(vals["PET_500m"].updateMask(both).multiply(w))
+    mincov = cfg["quality"]["min_season_coverage"]
+    out, specs = None, []
+
+    def add(im, name, layer, stat):
+        nonlocal out
+        im = im.rename(name)
+        out = im if out is None else out.addBands(im)
+        specs.append((name, layer, stat))
+
+    for layer, p in layers:
+        s = ee.ImageCollection.fromImages(sums[p]).sum()
+        d = ee.ImageCollection.fromImages(days[p]).sum()
+        cov = d.divide(float(s_days))
+        total = (s.divide(d.max(1)).multiply(float(s_days))
+                 .updateMask(d.gt(0)).updateMask(cov.gte(mincov)))
+        add(total, f"{p}_{season_key}_sum", layer,
+            "season_sum_scaled_to_full_season")
+        add(cov, f"{p}_{season_key}_coverage", layer, "coverage")
+    if cet:
+        cs = ee.ImageCollection.fromImages(cet).sum()
+        ps = ee.ImageCollection.fromImages(cpet).sum()
+        cov = ee.ImageCollection.fromImages(days["et"]).sum().divide(
+            float(s_days))
+        ratio = cs.divide(ps).updateMask(ps.gt(0)).updateMask(
+            cov.gte(mincov))
+        add(ratio, f"etpet_{season_key}_ratio", "ET_500m",
+            "ratio_of_sums_common_intervals")
+    return out, specs, len(comps)
+
+
+def gee_lc(cfg, year):
+    """LC_Type1 (IGBP) за год: класс 1–17 с QA (MCD12Q1)."""
+    img = gee_composite("MCD12Q1", year, 1, year_len(year))
+    v = gee_layer("MCD12Q1", img, "LC_Type1", cfg["quality"]["profile"])
+    return v.rename("lc"), [("lc", "LC_Type1", "class")], 1
+
+
+def gee_ptc(cfg, year):
+    """Percent_Tree_Cover за год (снимок ~5 марта), среднее 250 → 500 м."""
+    img = gee_composite("MOD44B", year, 60, 81)
+    v = gee_layer("MOD44B", img, "Percent_Tree_Cover",
+                  cfg["quality"]["profile"])
+    v = gee_to_grid("MOD44B", v, "Percent_Tree_Cover")
+    return v.rename("ptc"), [("ptc", "Percent_Tree_Cover", "percent")], 1
+
+
+def gee_gpp_annual(cfg, year):
+    """Годовая сумма GPP (MOD17A3HGF, с 2001 г.) — заполнение периода до
+    2020, когда 8-дневного MOD17A2HGF в GEE нет."""
+    img = gee_composite("MOD17A3HGF", year, 1, year_len(year))
+    raw = img.select("Gpp")
+    v = raw.multiply(1e-4).updateMask(raw.gte(0).And(raw.lte(32700)))
+    return v.rename("gpp_annual_sum"),         [("gpp_annual_sum", "Gpp", "annual_sum")], 1
+
+
+def gee_burned(cfg, year):
+    """Выгорание за год: burned (0/1, 255=нет данных) и DOY первого пожара
+    (MCD64A1, месячные композиты, QA как qa_mcd64)."""
+    import ee
+    profile = cfg["quality"]["profile"]
+    bds, oks = [], []
+    for st in composite_starts("MCD64A1", year):
+        a, b = composite_interval("MCD64A1", year, st)
+        img = gee_composite("MCD64A1", year, a, b)
+        raw = img.select("BurnDate")
+        qa = img.select("QA")
+        ok = qa.bitwiseAnd(1).eq(1).And(
+            qa.rightShift(1).bitwiseAnd(1).eq(1))
+        if profile == "strict":
+            ok = ok.And(qa.rightShift(2).bitwiseAnd(1).eq(0))
+        m = raw.gte(0).And(ok)
+        bds.append(raw.updateMask(m))
+        oks.append(m.unmask(0))
+    bdcol = ee.ImageCollection.fromImages(bds)
+    okcol = ee.ImageCollection.fromImages(oks)
+    burned = (bdcol.map(lambda i: i.gt(0).unmask(0)).max()
+              .updateMask(okcol.max().gt(0)).rename("burned"))
+    doy = bdcol.map(lambda i: i.updateMask(i.gt(0))).min().rename("burn_doy")
+    out = burned.addBands(doy)
+    return out, [("burned", "Burn Date", "binary"),
+                 ("burn_doy", "Burn Date", "first_doy")], 12
+
+
+def gee_grid_crs(prj: Project) -> str:
+    from rasterio.crs import CRS
+    return CRS.from_user_input(prj.grid().crs).to_wkt()
+
+
+def gee_blocks(grid: Grid, nbands: int, max_mb: float = 40.0):
+    """Разбиение сетки на блоки под лимит загрузки GEE (~50 МБ/запрос)."""
+    rows = int(max_mb * 1024 * 1024 // (grid.width * nbands * 4))
+    rows = max(1, min(rows, grid.height, 10000))
+    out, r0 = [], 0
+    while r0 < grid.height:
+        r1 = min(grid.height, r0 + rows)
+        out.append((r0, r1, 0, grid.width))
+        r0 = r1
+    return out
+
+
+def gee_download(prj: Project, group: str, year: int, image, band_specs):
+    """Скачивает multiband-изображение блоками (кэш + продолжение после
+    сбоя) и пишет годовые растры через annual_path. band_specs:
+    [(band, dtype, nodata, tags, role)]; role: primary|coverage|None.
+    Возвращает {band: статистика по AOI} или {} (всё уже скачано)."""
+    import ee
+    import requests
+    import io
+    import zipfile
+    import rasterio
+    grid = prj.grid()
+    am = grid.aoi_mask
+    wkt = gee_grid_crs(prj)
+    a = grid.affine
+    res, x0, y0 = a.a, a.c, a.f
+    names = [b[0] for b in band_specs]
+    paths = {b[0]: annual_path(prj, b[0], year) for b in band_specs}
+    if all(p.exists() for p in paths.values()):
+        LOG.info(f"GEE {group} {year}: уже готово — пропуск")
+        return {}
+    cache = prj.work / "gee_cache" / f"{group}_{year}"
+    cache.mkdir(parents=True, exist_ok=True)
+    blocks = gee_blocks(grid, len(names))
+    img = image.select(names).unmask(GEE_SENTINEL)
+    LOG.info(f"GEE {group} {year}: {len(blocks)} блоков × {len(names)} полос")
+
+    def fetch(r0, r1, c0, c1):
+        bf = cache / f"b_{r0:05d}_{c0:05d}.npy"
+        if bf.exists():
+            return
+        bx0, by0 = x0 + c0 * res, y0 - r0 * res
+        bx1, by1 = x0 + c1 * res, y0 - r1 * res
+        rect = ee.Geometry.Rectangle([bx0, by1, bx1, by0],
+                                     proj=ee.Projection(wkt), geodesic=False)
+        params = dict(bands=[{"id": n} for n in names], region=rect,
+                      crs=wkt, crsTransform=[res, 0, bx0, 0, -res, by0],
+                      format="GEO_TIFF")
+        last = None
+        for attempt in range(5):
+            try:
+                url = img.getDownloadURL(params)
+                r = requests.get(url, timeout=(30, 600))
+                r.raise_for_status()
+                data = r.content
+                if data[:2] == b"PK":
+                    zf = zipfile.ZipFile(io.BytesIO(data))
+                    inner = [n for n in zf.namelist()
+                             if n.lower().endswith(".tif")]
+                    data = zf.read(inner[0])
+                with rasterio.open(io.BytesIO(data)) as src:
+                    arr = src.read()
+                if arr.shape != (len(names), r1 - r0, c1 - c0):
+                    raise IOError(f"блок {arr.shape} != "
+                                  f"{(len(names), r1 - r0, c1 - c0)}")
+                np.save(bf, arr.astype("float32"))
+                return
+            except Exception as e:
+                last = e
+                LOG.debug(f"GEE блок {r0}: {e}; повтор")
+                time.sleep(min(60, 2 ** attempt))
+        raise RuntimeError(f"GEE: блок строк {r0}-{r1} не скачан: {last}")
+
+    nw = int(prj.cfg["data"].get("gee_workers", 4))
+    with cf.ThreadPoolExecutor(nw) as ex:
+        list(ex.map(lambda b: fetch(*b), blocks))
+    stats = {}
+    mincov = prj.cfg["quality"]["min_season_coverage"]
+    for bi, (band, dtype, nodata, tags, role) in enumerate(band_specs):
+        arr = np.full((grid.height, grid.width), np.nan, "float32")
+        for (r0, r1, c0, c1) in blocks:
+            blk = np.load(cache / f"b_{r0:05d}_{c0:05d}.npy")
+            arr[r0:r1, c0:c1] = blk[bi]
+        arr[arr == GEE_SENTINEL] = np.nan
+        if dtype == "uint8":
+            out = np.where(np.isfinite(arr), arr, NODATA_U8).astype("uint8")
+        else:
+            out = arr
+        write_raster(paths[band], out, grid, nodata=nodata, dtype=dtype,
+                     tags=tags)
+        if am.any():
+            v = arr[am]
+            stats[band] = dict(
+                frac_valid=float(np.isfinite(v).mean()),
+                mean=float(np.nanmean(v)) if np.isfinite(v).any() else None,
+                frac_lowcov=float((v < mincov).mean())
+                if role == "coverage" else None)
+    shutil.rmtree(cache, ignore_errors=True)
+    return stats
+
+
+def stage_prepare_gee(prj: Project):
+    """prepare при backend=gee: те же годовые растры work/annual, источник —
+    Google Earth Engine. Дальнейшие этапы не меняются."""
+    cfg = prj.cfg
+    gee_init(cfg)
+    grid = prj.grid()
+    prods = cfg["data"]["products"]
+    profile = cfg["quality"]["profile"]
+    qrows: List[dict] = []
+    missing: List[tuple] = []
+    gpp_mode = str(cfg["data"].get("gee_gpp", "annual")).lower()
+
+    def specs_to_bands(prod, specs, season_key=None, extra=None):
+        out = []
+        for band, layer, stat in specs:
+            tags = dict(source_product=f"{prod}.061", layer=layer,
+                        statistic=stat, qa_profile=profile, backend="gee",
+                        run_id=prj.run_id)
+            if season_key:
+                tags.update(season=season_key, season_range="..".join(
+                    cfg["seasons"][season_key]))
+            if extra:
+                tags.update(extra)
+            u8 = band in ("lc", "burned")
+            role = ("primary" if stat in ("mean", "sum", "class", "percent",
+                                          "binary", "annual_sum")
+                    else "coverage" if stat == "coverage" else None)
+            out.append((band, "uint8" if u8 else "float32",
+                        NODATA_U8 if u8 else np.nan, tags, role))
+        return out
+
+    def emit(group, year, image, specs, n_expected, product, variables,
+             season_key=None, extra=None):
+        st = gee_download(prj, group, year, image,
+                          specs_to_bands(product, specs, season_key, extra))
+        if not st:
+            return True
+        prim = next((b[0] for b in specs if b[2] in
+                     ("mean", "sum", "class", "percent", "binary",
+                      "annual_sum")), specs[0][0])
+        if not st.get(prim, {}).get("frac_valid"):
+            return False
+        for v in variables:
+            cs = st.get(f"{v}_coverage")
+            qrows.append(dict(
+                variable=v, year=year, product=product,
+                n_expected=n_expected, n_loaded=None,
+                mean_coverage=(cs["mean"] if cs and cs.get("mean") is not None
+                               else st[prim]["frac_valid"]),
+                insufficient_fraction=cs["frac_lowcov"] if cs else None,
+                qa_profile=profile))
+        return True
+
+    for y in prj.years:
+        t0 = time.time()
+        if "MCD12Q1" in prods:
+            if not emit("lc", y, *gee_lc(cfg, y), "MCD12Q1", ["lc"]):
+                missing.append(("MCD12Q1", y))
+        if "MOD44B" in prods:
+            if not emit("ptc", y, *gee_ptc(cfg, y), "MOD44B", ["ptc"]):
+                missing.append(("MOD44B", y))
+        for prod, pref in (("MOD13Q1", "evi_terra"), ("MYD13Q1", "evi_aqua")):
+            if prod in prods:
+                ls = [("250m 16 days EVI", pref),
+                      ("250m 16 days NDVI", pref.replace("evi", "ndvi"))]
+                r = gee_state_stats(cfg, prod, y, "growing", ls,
+                                    use_pixel_doy="250m 16 days composite "
+                                    "day of the year")
+                if r is None or not emit(f"{prod}_vi", y, r[0], r[1], r[2],
+                                         prod,
+                                         [f"{p}_growing" for _, p in ls],
+                                         season_key="growing"):
+                    missing.append((prod, y))
+        if "MCD15A2H" in prods:
+            ls = [("Lai_500m", "lai"), ("Fpar_500m", "fpar")]
+            r = gee_state_stats(cfg, "MCD15A2H", y, "growing", ls)
+            if r is None or not emit("mcd15", y, r[0], r[1], r[2],
+                                     "MCD15A2H",
+                                     [f"{p}_growing" for _, p in ls],
+                                     season_key="growing"):
+                missing.append(("MCD15A2H", y))
+        if "MOD17A2HGF" in prods:
+            if gpp_mode == "annual":
+                if not emit("gpp_annual", y, *gee_gpp_annual(cfg, y),
+                            "MOD17A3HGF", ["gpp_annual"]):
+                    missing.append(("MOD17A2HGF", y))
+            else:
+                r = gee_accumulated(cfg, "MOD17A2HGF", y, "growing",
+                                    [("Gpp_500m", "gpp")])
+                if r is None or not emit("gpp", y, r[0], r[1], r[2],
+                                         "MOD17A2HGF", ["gpp_growing"],
+                                         season_key="growing"):
+                    missing.append(("MOD17A2HGF", y))
+        if "MOD16A2GF" in prods:
+            r = gee_accumulated(cfg, "MOD16A2GF", y, "growing",
+                                [("ET_500m", "et"), ("PET_500m", "pet")])
+            if r is None or not emit("mod16", y, r[0], r[1], r[2],
+                                     "MOD16A2GF", ["et_growing",
+                                                   "pet_growing"],
+                                     season_key="growing"):
+                missing.append(("MOD16A2GF", y))
+        for prod, plat in (("MOD11A2", "terra"), ("MYD11A2", "aqua")):
+            if prod in prods:
+                ok_day = False
+                for var, layer in (("lstday", "LST_Day_1km"),
+                                   ("lstnight", "LST_Night_1km")):
+                    r = gee_state_stats(cfg, prod, y, "summer",
+                                        [(layer, f"{var}_{plat}")])
+                    if r and emit(f"{prod}_{var}", y, r[0], r[1], r[2],
+                                  prod, [f"{var}_{plat}_summer"],
+                                  season_key="summer") and var == "lstday":
+                        ok_day = True
+                if not ok_day:
+                    missing.append((prod, y))
+        if "MCD64A1" in prods:
+            if not emit("burned", y, *gee_burned(cfg, y), "MCD64A1",
+                        ["burned"]):
+                missing.append(("MCD64A1", y))
+        LOG.info(f"prepare(GEE) {y}: {time.time() - t0:.0f} с")
+    q = pd.DataFrame(qrows)
+    save_table(prj, q, "quality_annual_layers")
+    if missing:
+        m = pd.DataFrame(missing, columns=["product", "year"]).drop_duplicates()
+        save_table(prj, m, "missing_product_years")
+        LOG.warning(f"Отсутствуют данные для {len(m)} продукт-лет")
+        req = [p for p, _ in missing if PRODUCTS[p]["required"]]
+        if req and cfg["data"]["fail_on_missing_required"]:
+            raise RuntimeError(
+                "Отсутствуют обязательные продукты: " +
+                ", ".join(sorted(set(f"{p}:{y}" for p, y in missing
+                                     if PRODUCTS[p]["required"]))) +
+                ". Установите data.fail_on_missing_required: false для "
+                "явно обозначенного неполного сценария.")
+    return {"missing_product_years": len(missing), "backend": "gee"}
+
+
+def cmd_gee_info(prj: Project):
+    """Проверка доступа к Earth Engine и покрытия продуктов."""
+    cfg = prj.cfg
+    ee = gee_init(cfg)
+    y0, y1 = prj.years[0], prj.years[-1]
+    LOG.info("Earth Engine: подключение установлено")
+    for prod in cfg["data"]["products"]:
+        g = GEE_ASSETS.get(prod)
+        if not g:
+            LOG.warning(f"{prod}: нет в каталоге GEE")
+            continue
+        col = (ee.ImageCollection(g["asset"])
+               .filterDate(f"{y0}-01-01", f"{y1 + 1}-01-01"))
+        n = col.size().getInfo()
+        rng = col.reduceColumns(ee.Reducer.minMax(),
+                                ["system:time_start"]).getInfo()
+        d = lambda t: dt.datetime.fromtimestamp(
+            t / 1000, dt.timezone.utc).date()
+        LOG.info(f"{prod} → {g['asset']}: {n} изображений, "
+                 f"{d(rng['min'])} … {d(rng['max'])}"
+                 + (" (замена: MCD15A3H)" if prod == "MCD15A2H" else "")
+                 + (" (только 2021+; годовой GPP — MOD17A3HGF)"
+                    if prod == "MOD17A2HGF" else ""))
+    return 0
+
+
+# =============================================================================
 # 12. Табличный вывод
 # =============================================================================
 COMMON_FIELDS = ["run_id", "result_id"]
@@ -3012,6 +3687,16 @@ def functional_pixel_stats(prj: Project, var: str, layer: str,
     return out, yrs
 
 
+def func_layer(prj: Project, var: str):
+    """Слой функциональной переменной. Для GPP — запасной вариант
+    gpp_annual_sum, если сезонного GPP нет (GEE-бэкенд до 2020 г.)."""
+    layer = FUNC_VARS.get(var) or LST_VARS.get(var)
+    if var == "gpp" and layer and not any(
+            annual_path(prj, layer, y).exists() for y in prj.years):
+        return "gpp_annual_sum"
+    return layer
+
+
 def stage_functional(prj: Project):
     cfg = prj.cfg
     grid = prj.grid()
@@ -3020,7 +3705,7 @@ def stage_functional(prj: Project):
     regional = []
     st = cfg["statistics"]
     for var in cfg["functional"]["variables"]:
-        layer = FUNC_VARS.get(var)
+        layer = func_layer(prj, var)
         if not layer:
             continue
         r = functional_pixel_stats(prj, var, layer)
@@ -3044,7 +3729,7 @@ def stage_functional(prj: Project):
                              tags=dict(effective_resolution_m=1000))
     # региональные ряды по типам покрова
     for var in done:
-        layer = FUNC_VARS.get(var) or LST_VARS.get(var)
+        layer = func_layer(prj, var)
         for y in prj.years:
             p = annual_path(prj, layer, y)
             if not p.exists():
@@ -4365,6 +5050,8 @@ def _register_stages():
 
 def run_stages(prj: Project, from_stage=None, to_stage=None, resume=True):
     _register_stages()
+    if prj.cfg["data"].get("backend") == "gee":
+        STAGE_FUNCS["prepare"] = stage_prepare_gee
     i0 = STAGES.index(from_stage) if from_stage else 0
     i1 = STAGES.index(to_stage) if to_stage else len(STAGES) - 1
     (prj.logs / f"config_{prj.run_id}.json").write_text(
@@ -4427,6 +5114,7 @@ grid:
 data:
   collection_version: "061"
   mode: online                  # online | offline
+  backend: earthdata_https      # earthdata_https | gee (Google Earth Engine)
   fail_on_missing_required: true
   download_workers: 4
 
@@ -4556,10 +5244,15 @@ def cmd_interactive(args=None):
         ch = _ask("Выбор [1]: ", "1")
         if ch == "0":
             break
+        is_gee = prj.cfg["data"].get("backend") == "gee"
         if ch in ("1", "6"):
-            run_inventory(prj, online=online)
-            run_plan(prj)
-        if ch in ("2", "6") and online:
+            if is_gee:
+                LOG.info("backend=gee: поиск гранул не нужен (данные "
+                         "получает Earth Engine на этапе prepare)")
+            else:
+                run_inventory(prj, online=online)
+                run_plan(prj)
+        if ch in ("2", "6") and online and not is_gee:
             if not (prj.inv / "granule_catalog.csv").exists():
                 run_inventory(prj, online=True)
             run_download(prj)
@@ -4591,7 +5284,8 @@ def main(argv=None):
                       ("download", "скачивание гранул (Earthdata Login)"),
                       ("run", "выполнить этапы анализа"),
                       ("sensitivity", "анализ чувствительности"),
-                      ("export", "экспорт таблиц, рисунков и пакета для ИИ")):
+                      ("export", "экспорт таблиц, рисунков и пакета для ИИ"),
+                      ("gee-info", "проверить доступ к Google Earth Engine")):
         p = sp.add_parser(name, help=hlp)
         p.add_argument("--config", default=None,
                        help="config.yaml (если не указан — окно выбора)")
@@ -4637,11 +5331,19 @@ def main(argv=None):
         print("ОШИБКА КОНФИГУРАЦИИ:", e)
         return 2
     online = prj.cfg["data"]["mode"] == "online"
+    is_gee = prj.cfg["data"].get("backend") == "gee"
     if args.cmd == "validate":
         g = prj.grid()
         tiles = aoi_sinusoidal_tiles(prj.cfg)
         LOG.info(f"AOI корректна; сетка {g.width}×{g.height} ячеек по "
                  f"{g.res:.0f} м, CRS: {g.crs}; тайлы MODIS: {', '.join(tiles)}")
+        return 0
+    if args.cmd == "gee-info":
+        return cmd_gee_info(prj)
+    if is_gee and args.cmd in ("inventory", "plan", "download"):
+        LOG.info("backend=gee: гранулы NASA не нужны — этапы inventory/plan/"
+                 "download пропущены. Запускайте run (или gee-info для "
+                 "проверки доступа).")
         return 0
     if args.cmd == "inventory":
         run_inventory(prj, online=online)
@@ -4657,7 +5359,7 @@ def main(argv=None):
         run_download(prj)
         return 0
     if args.cmd == "run":
-        if args.with_download and online:
+        if args.with_download and online and not is_gee:
             run_inventory(prj, online=True)
             run_download(prj)
         run_stages(prj, args.from_stage, args.to_stage, args.resume)

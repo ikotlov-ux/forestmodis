@@ -46,6 +46,39 @@ pip install -r requirements.txt
 
 Для HDF4 нужен `pyhdf` (или GDAL с драйвером HDF4). На Windows проще всего поставить через conda: `conda install -c conda-forge pyhdf rasterio geopandas`.
 
+## Бэкенд Google Earth Engine (без скачивания гранул)
+
+Вместо загрузки ~1 ТБ гранул NASA можно готовить сезонные слои в [Google Earth Engine](https://code.earthengine.google.com): на компьютер приходят только готовые годовые растры. Для этого нужен аккаунт Google с зарегистрированным некоммерческим проектом Earth Engine и установленный пакет:
+
+```bash
+pip install earthengine-api
+earthengine authenticate
+```
+
+В `config.yaml` укажите:
+
+```yaml
+data:
+  backend: gee
+  gee_project: ваш-проект-google-cloud   # Project info в code.earthengine.google.com
+  gee_gpp: annual   # annual (MOD17A3HGF, весь период) | growing (только 2021+)
+```
+
+Готовый пример — `examples/config_gee_european_russia.yaml`. Проверка доступа и покрытия продуктов:
+
+```bash
+python forestmodis.py gee-info --config config.yaml
+```
+
+Затем `python forestmodis.py run --config config.yaml` (этапы inventory/download/plan пропускаются автоматически). Остальные этапы и результаты не отличаются; слои пишутся в те же файлы `work/annual/…`, прерванная загрузка возобновляется с места сбоя (кэш блоков в `work/gee_cache/`).
+
+### Отличия от загрузки гранул
+
+- Каталог Earth Engine содержит те же продукты MODIS C6.1, но MCD15A2H там отсутствует: используется 4-дневный MCD15A3H (Terra+Aqua, с июля 2002 г.), а сезонные статистики считаются по нему. Это отражено в тегах растров (`backend=gee`, источник).
+- 8-дневный GPP (MOD17A2HGF) есть в Earth Engine только с 2021 г. По умолчанию (`gee_gpp: annual`) годовой GPP берётся из MOD17A3HGF на весь период; сезонный GPP доступен только с 2021 г. Функциональный анализ автоматически использует доступный вариант.
+- Значения могут незначительно отличаться от варианта с загрузкой гранул (перепроекция и усреднение выполняются на серверах Google), но правила QA, периоды и имена слоёв совпадают.
+- Объём скачивания — порядка 200–300 ГБ на Европейскую территорию России (все годовые слои за 2003–2024) против ~1 ТБ гранул; лучше всего запускать при стабильном интернете, скорость лимитируется очередью Earth Engine (4 параллельных запроса по `data.gee_workers`).
+
 ## Доступ к данным NASA (Earthdata Login)
 
 Поиск гранул (`inventory`, `plan`) работает без авторизации. Для скачивания нужна бесплатная учётная запись [NASA Earthdata](https://urs.earthdata.nasa.gov/users/new). Задайте её одним из способов:
