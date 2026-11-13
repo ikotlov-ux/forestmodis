@@ -996,6 +996,66 @@ LPDAAC_PROBE_URL = (
     "BROWSE.MOD13Q1.A2000049.h20v03.061.2020041155742.1.jpg")
 
 
+_DOH_CACHE: Dict[str, List[str]] = {}
+_DNS_PATCHED = False
+
+
+def _doh_resolve(host: str) -> List[str]:
+    """Адреса IPv4 через DNS-over-HTTPS (Cloudflare, затем Google)."""
+    if host in _DOH_CACHE:
+        return _DOH_CACHE[host]
+    import requests
+    for url in ("https://cloudflare-dns.com/dns-query",
+                "https://dns.google/resolve"):
+        try:
+            j = requests.get(url, params={"name": host, "type": "A"},
+                             headers={"accept": "application/dns-json"},
+                             timeout=10).json()
+            ips = [a["data"] for a in j.get("Answer", []) if a.get("type") == 1]
+            if ips:
+                _DOH_CACHE[host] = ips
+                return ips
+        except Exception:
+            continue
+    return []
+
+
+def enable_dns_fallback():
+    """Если системный DNS не находит хост (так бывает у DNS-серверов VPN,
+    которые блокируют *.nasa.gov), адрес берётся через DNS-over-HTTPS.
+    Подключение остаётся по HTTPS с проверкой сертификата по имени хоста."""
+    global _DNS_PATCHED
+    if _DNS_PATCHED:
+        return
+    import socket
+    orig = socket.getaddrinfo
+
+    def getaddrinfo(host, port, *args, **kw):
+        try:
+            return orig(host, port, *args, **kw)
+        except socket.gaierror:
+            if not isinstance(host, str) or host in (
+                    "cloudflare-dns.com", "dns.google"):
+                raise
+            ips = _doh_resolve(host)
+            if not ips:
+                raise
+            if host not in _DOH_LOGGED:
+                _DOH_LOGGED.add(host)
+                LOG.warning(f"Системный DNS не нашёл {host}; адрес {ips[0]} "
+                            "получен через DNS-over-HTTPS")
+            out = []
+            for ip in ips:
+                out += orig(ip, port, *args, **kw)
+            return out
+
+    socket.getaddrinfo = getaddrinfo
+    _DNS_PATCHED = True
+
+
+_DOH_LOGGED: set = set()
+
+
 def _probe_url(url, params=None, min_bytes=40_000, timeout=(10, 15)) -> Tuple[bool, str]:
     """Читает ответ целиком. Возвращает (успех, описание). Ловит «зависание»
     соединения после первых ~16 КБ (характерно для фильтрации трафика)."""
@@ -1016,6 +1076,7 @@ def _probe_url(url, params=None, min_bytes=40_000, timeout=(10, 15)) -> Tuple[bo
 def choose_source(cfg) -> str:
     """auto → lpdaac, если CMR и хранилище LP DAAC отдают данные полностью;
     иначе laads. Явное значение data.source возвращается как есть."""
+    enable_dns_fallback()
     src = str(cfg["data"].get("source", "auto")).lower()
     if src in ("lpdaac", "laads"):
         return src
@@ -1041,7 +1102,8 @@ def choose_source(cfg) -> str:
         return "laads"
     raise RuntimeError(
         "Серверы NASA недоступны из этой сети: и CMR/LP DAAC, и LAADS DAAC "
-        "обрывают передачу. Включите VPN или прокси (переменные среды "
+        "не отвечают или обрывают передачу (подробности в журнале выше). "
+        "Включите VPN или прокси (переменные среды "
         "HTTPS_PROXY/HTTP_PROXY учитываются) либо скачайте HDF на другом "
         "компьютере и запустите с data.mode: offline.")
 
@@ -1393,6 +1455,7 @@ def run_download(prj: Project):
     LOG.info(f"К загрузке: {len(todo)} из {len(cat)} гранул")
     if todo.empty:
         return reg
+    enable_dns_fallback()
     hosts = todo["url"].astype(str)
     sess_laads = laads_session(cfg) if hosts.str.contains("ladsweb").any() \
         else None
