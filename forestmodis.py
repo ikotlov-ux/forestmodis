@@ -582,6 +582,35 @@ def pick_files_dialog(title, multiple=False, filetypes=None):
         return []
 
 
+def pick_folder_dialog(title: str) -> Optional[str]:
+    """Окно Проводника для выбора папки (tkinter)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        r = filedialog.askdirectory(title=title, mustexist=False)
+        root.destroy()
+        return r or None
+    except Exception as e:
+        LOG.debug(f"Диалог выбора папки недоступен: {e}")
+        return None
+
+
+def in_notebook() -> bool:
+    """Запуск из Jupyter/IPython-ядра."""
+    return "ipykernel" in sys.modules
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    try:
+        v = input(prompt).strip()
+    except EOFError:
+        v = ""
+    return v or default
+
+
 def read_aoi(cfg: dict):
     import geopandas as gpd
     path = cfg["inputs"].get("aoi")
@@ -594,6 +623,9 @@ def read_aoi(cfg: dict):
     p = Path(path)
     if not p.is_absolute():
         p = Path(cfg["project"]["root"]) / p
+    if not p.exists():
+        raise ConfigError(f"файл территории не найден: {p}. Положите полигон "
+                          "туда или укажите путь в inputs.aoi (config.yaml)")
     gdf = gpd.read_file(p)
     if gdf.crs is None:
         raise ConfigError(f"AOI {p}: не задана система координат")
@@ -4183,40 +4215,84 @@ def _project(args) -> Project:
     return prj
 
 
-def cmd_interactive(args):
-    print("ForestMODIS — интерактивный режим")
-    cfgp = pick_files_dialog("Выберите config.yaml проекта (Отмена — новый "
-                             "проект)", False, [("YAML", "*.yaml *.yml")])
-    if not cfgp:
-        d = input("Папка нового проекта [./forest_project]: ").strip() or \
-            "./forest_project"
-        cmd_init(argparse.Namespace(project=d, force=False))
-        aoi = pick_files_dialog("Выберите полигон территории", False,
-                                [("Векторные", "*.gpkg *.geojson *.shp")])
-        cfgp = str(Path(d).resolve() / "config.yaml")
-        if aoi:
-            import yaml
-            c = yaml.safe_load(open(cfgp, encoding="utf-8"))
-            c["inputs"]["aoi"] = str(Path(aoi).resolve())
-            y0 = input("Начальный год [2003]: ").strip()
-            y1 = input("Конечный год [2024]: ").strip()
-            if y0:
-                c["period"]["start_year"] = int(y0)
-            if y1:
-                c["period"]["end_year"] = int(y1)
-            yaml.safe_dump(c, open(cfgp, "w", encoding="utf-8"),
-                           allow_unicode=True, sort_keys=False)
-    else:
+def cmd_interactive(args=None):
+    """Пошаговый режим: окна выбора файлов/папок и меню действий.
+    Запускается командой `interactive` или при запуске без аргументов
+    (в том числе из JupyterLab: `%run forestmodis.py`)."""
+    print("ForestMODIS — пошаговый режим")
+    cfgp = pick_files_dialog("Выберите config.yaml проекта (Отмена — создать "
+                             "новый проект)", False, [("YAML", "*.yaml *.yml")])
+    if cfgp:
         cfgp = cfgp[0] if isinstance(cfgp, (list, tuple)) else cfgp
-    ns = argparse.Namespace(config=cfgp, verbose=False, offline=False)
-    prj = _project(ns)
-    run_inventory(prj, online=prj.cfg["data"]["mode"] == "online")
-    run_plan(prj)
-    if input("Скачать данные и выполнить расчёт? [y/N]: ").strip().lower() \
-            in ("y", "д", "yes", "да"):
-        if prj.cfg["data"]["mode"] == "online":
+    else:
+        d = pick_folder_dialog("Выберите или создайте папку нового проекта")
+        if not d:
+            d = _ask("Папка нового проекта [./forest_project]: ",
+                     "./forest_project")
+        cmd_init(argparse.Namespace(project=d, force=False))
+        cfgp = str(Path(d).resolve() / "config.yaml")
+        import yaml
+        with open(cfgp, encoding="utf-8") as f:
+            c = yaml.safe_load(f)
+        aoi = pick_files_dialog("Выберите полигон территории исследования",
+                                False, [("Векторные", "*.gpkg *.geojson *.json "
+                                         "*.shp"), ("Все файлы", "*.*")])
+        if aoi:
+            c["inputs"]["aoi"] = str(Path(aoi[0]).resolve())
+        else:
+            print("Полигон не выбран: положите его в inputs/aoi.gpkg проекта.")
+        y0 = _ask("Начальный год [2003]: ", "2003")
+        y1 = _ask("Конечный год [2024]: ", "2024")
+        c["period"]["start_year"], c["period"]["end_year"] = int(y0), int(y1)
+        # базовые периоды не должны выходить за пределы периода
+        a, b = int(y0), int(y1)
+        c["period"]["comparison_baseline"] = [a, min(a + 2, b)]
+        c["period"]["anomaly_baseline"] = [a, min(a + 9, b)]
+        with open(cfgp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(c, f, allow_unicode=True, sort_keys=False)
+        print(f"Конфигурация сохранена: {cfgp}")
+    try:
+        prj = _project(argparse.Namespace(config=cfgp, verbose=False,
+                                          offline=False))
+        g = prj.grid()
+        LOG.info(f"Сетка {g.width}×{g.height} ячеек по {g.res:.0f} м; тайлы "
+                 f"MODIS: {', '.join(aoi_sinusoidal_tiles(prj.cfg))}")
+    except ConfigError as e:
+        print("ОШИБКА КОНФИГУРАЦИИ:", e)
+        return 2
+    online = prj.cfg["data"]["mode"] == "online"
+    menu = {"1": "inventory + plan (поиск гранул и оценка объёма, без загрузки)",
+            "2": "download (скачивание, нужен вход NASA Earthdata)",
+            "3": "run (все этапы расчёта, с продолжением)",
+            "4": "sensitivity (анализ чувствительности)",
+            "5": "export (пакет для анализа)",
+            "6": "всё подряд: inventory → download → run → sensitivity → "
+                 "export",
+            "0": "выход"}
+    while True:
+        print("\nДействия:")
+        for k, v in menu.items():
+            print(f"  {k} — {v}")
+        ch = _ask("Выбор [1]: ", "1")
+        if ch == "0":
+            break
+        if ch in ("1", "6"):
+            run_inventory(prj, online=online)
+            run_plan(prj)
+        if ch in ("2", "6") and online:
+            if not (prj.inv / "granule_catalog.csv").exists():
+                run_inventory(prj, online=True)
             run_download(prj)
-        run_stages(prj, resume=True)
+        if ch in ("3", "6"):
+            run_stages(prj, resume=True)
+        if ch in ("4", "6"):
+            LOG.info(f"Чувствительность: {run_sensitivity(prj)}")
+        if ch in ("5", "6"):
+            _register_stages()
+            LOG.info(f"Экспорт: {stage_export(prj)} → {prj.pkg}")
+        if ch == "6":
+            break
+    return 0
 
 
 def main(argv=None):
@@ -4252,6 +4328,17 @@ def main(argv=None):
         if name == "export":
             p.add_argument("--profile", default="ai", choices=["ai", "full"])
     sp.add_parser("interactive", help="пошаговый режим с окнами выбора файлов")
+    if argv is None:
+        argv = sys.argv[1:]
+        if in_notebook():
+            # ядро Jupyter передаёт «-f kernel-....json»: это не наши аргументы
+            argv = [a for i, a in enumerate(argv)
+                    if a != "-f" and not (i and argv[i - 1] == "-f")
+                    and not a.endswith(".json")]
+    argv = list(argv)
+    if not argv:
+        # запуск без аргументов (двойной щелчок, Jupyter, IDE) → пошаговый режим
+        return cmd_interactive(None)
     args = ap.parse_args(argv)
 
     if args.cmd == "init":
@@ -4310,4 +4397,11 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    if in_notebook():
+        # в Jupyter не вызываем sys.exit, чтобы не получать SystemExit
+        try:
+            main()
+        except SystemExit:
+            pass
+    else:
+        sys.exit(main() or 0)

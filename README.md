@@ -74,6 +74,19 @@ python forestmodis.py export    --config D:\work\central_russia\config.yaml
 
 Если `--config` не указан, открывается окно Проводника для выбора файла. Команда `python forestmodis.py interactive` ведёт по шагам с окнами выбора AOI и папки проекта.
 
+### Запуск из JupyterLab или IDE
+
+Если запустить скрипт без аргументов (`%run forestmodis.py`, кнопка Run в IDE, двойной щелчок), включается пошаговый режим. Сначала открывается окно выбора `config.yaml`. Если нажать «Отмена», скрипт предложит выбрать папку нового проекта и полигон территории, затем спросит годы. После этого появится меню действий: поиск гранул и план, загрузка, расчёт, чувствительность, экспорт.
+
+Отдельные команды в Jupyter:
+
+```python
+%run forestmodis.py validate --config D:/work/central_russia/config.yaml
+# или
+import forestmodis as fm
+fm.main(["inventory", "--config", "D:/work/central_russia/config.yaml"])
+```
+
 Частичный перезапуск: `run --from-stage functional --to-stage export`; принудительный пересчёт: `--no-resume`; офлайн-режим по уже скачанному архиву: `--offline`.
 
 ## Структура проекта
