@@ -1031,6 +1031,11 @@ def enable_dns_fallback():
     orig = socket.getaddrinfo
 
     def getaddrinfo(host, port, *args, **kw):
+        if isinstance(host, str) and host in _DOH_CACHE:
+            out = []
+            for ip in _DOH_CACHE[host]:
+                out += orig(ip, port, *args, **kw)
+            return out
         try:
             return orig(host, port, *args, **kw)
         except socket.gaierror:
