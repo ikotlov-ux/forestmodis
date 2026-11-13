@@ -9,3 +9,4 @@ logs/
 *.part
 .netrc
 _netrc
+.earthdata_token

@@ -304,7 +304,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                           "MCD15A2H", "MOD17A2HGF", "MOD16A2GF", "MOD11A2",
                           "MYD11A2", "MCD64A1"],
              "download_workers": 4, "retries": 5, "timeout_s": 300,
-             "cmr_url": "https://cmr.earthdata.nasa.gov/search"},
+             "cmr_url": "https://cmr.earthdata.nasa.gov/search",
+             # источник гранул: auto (проверка сети), lpdaac (CMR + LP DAAC
+             # Cloud) или laads (LAADS DAAC; нужен токен Earthdata)
+             "source": "auto",
+             "laads_url": "https://ladsweb.modaps.eosdis.nasa.gov",
+             "search_workers": 6},
     "quality": {"profile": "standard", "min_season_coverage": 0.5,
                 "min_window_valid_fraction": 0.95, "interpolate": False},
     "landcover": {"classes": [1, 3, 4, 5, 8, 9],
@@ -923,7 +928,7 @@ def cmr_search(cfg, prod, tiles, year_from, year_to, raw_dir: Path) -> List[dict
         for attempt in range(cfg["data"]["retries"]):
             try:
                 r = requests.get(url, params=params, headers=headers,
-                                 timeout=120)
+                                 timeout=(15, 120))
                 if 400 <= r.status_code < 500 and r.status_code != 429:
                     raise RuntimeError(f"CMR {prod}: HTTP {r.status_code}: "
                                        f"{r.text[:500]}")
@@ -963,8 +968,8 @@ def cmr_search(cfg, prod, tiles, year_from, year_to, raw_dir: Path) -> List[dict
                 # имя часто «Not provided»: берём запись .hdf или единственную
                 if str(ad.get("Name", "")).endswith(".hdf") or len(adis) == 1:
                     size = ad.get("SizeInBytes") or (
-                        ad.get("Size", 0) * {"KB": 1e3, "MB": 1e6,
-                                             "GB": 1e9}.get(
+                        ad.get("Size", 0) * {"KB": 2.0 ** 10, "MB": 2.0 ** 20,
+                                             "GB": 2.0 ** 30}.get(
                             ad.get("SizeUnit", "MB"), 1e6))
                     ck = ad.get("Checksum") or {}
                     cks, alg = ck.get("Value"), ck.get("Algorithm")
@@ -982,6 +987,197 @@ def cmr_search(cfg, prod, tiles, year_from, year_to, raw_dir: Path) -> List[dict
             break
         headers["CMR-Search-After"] = sa
     return items
+
+
+# ---- проверка сети и альтернативный источник LAADS DAAC ---------------------
+LPDAAC_PROBE_URL = (
+    "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-public/MOD13Q1.061/"
+    "MOD13Q1.A2000049.h20v03.061.2020041155741/"
+    "BROWSE.MOD13Q1.A2000049.h20v03.061.2020041155742.1.jpg")
+
+
+def _probe_url(url, params=None, min_bytes=40_000, timeout=(10, 15)) -> Tuple[bool, str]:
+    """Читает ответ целиком. Возвращает (успех, описание). Ловит «зависание»
+    соединения после первых ~16 КБ (характерно для фильтрации трафика)."""
+    import requests
+    n = 0
+    try:
+        with requests.get(url, params=params, stream=True, timeout=timeout,
+                          headers={"Accept-Encoding": "identity"}) as r:
+            for ch in r.iter_content(8192):
+                n += len(ch)
+                if n >= min_bytes:
+                    break
+            return True, f"HTTP {r.status_code}, получено {n} байт"
+    except Exception as e:
+        return False, f"{type(e).__name__} после {n} байт"
+
+
+def choose_source(cfg) -> str:
+    """auto → lpdaac, если CMR и хранилище LP DAAC отдают данные полностью;
+    иначе laads. Явное значение data.source возвращается как есть."""
+    src = str(cfg["data"].get("source", "auto")).lower()
+    if src in ("lpdaac", "laads"):
+        return src
+    cmr = cfg["data"]["cmr_url"].rstrip("/") + "/granules.json"
+    ok1, m1 = _probe_url(cmr, dict(short_name="MOD13Q1", version="061",
+                                   page_size=20))
+    ok2, m2 = (_probe_url(LPDAAC_PROBE_URL, min_bytes=30_000) if ok1
+               else (False, "не проверялось"))
+    LOG.info(f"Проверка сети: CMR — {m1}; LP DAAC — {m2}")
+    if ok1 and ok2:
+        return "lpdaac"
+    laads = cfg["data"].get("laads_url", "https://ladsweb.modaps.eosdis.nasa.gov")
+    ok3, m3 = _probe_url(laads.rstrip("/") + "/api/v2/content/details",
+                         dict(products="MOD13Q1", collections="61",
+                              temporalRanges="2003-01-01..2003-01-02"),
+                         min_bytes=20_000)
+    LOG.info(f"Проверка сети: LAADS DAAC — {m3}")
+    if ok3:
+        LOG.warning("Серверы CMR/LP DAAC обрывают передачу данных из вашей сети "
+                    "(соединение «зависает» после первых килобайт). Используется "
+                    "зеркало LAADS DAAC с теми же файлами MODIS C6.1. Чтобы "
+                    "задать источник явно, укажите data.source в config.yaml.")
+        return "laads"
+    raise RuntimeError(
+        "Серверы NASA недоступны из этой сети: и CMR/LP DAAC, и LAADS DAAC "
+        "обрывают передачу. Включите VPN или прокси (переменные среды "
+        "HTTPS_PROXY/HTTP_PROXY учитываются) либо скачайте HDF на другом "
+        "компьютере и запустите с data.mode: offline.")
+
+
+def laads_search(cfg, prod, tiles, years: Sequence[int], raw_dir: Path) -> List[dict]:
+    """Поиск гранул через LAADS DAAC API v2 (одна страница = одна дата)."""
+    import requests
+    base = cfg["data"].get("laads_url",
+                           "https://ladsweb.modaps.eosdis.nasa.gov").rstrip("/")
+    url = base + "/api/v2/content/details"
+    region = None
+    try:
+        aoi, _, _ = read_aoi(cfg)
+        b = aoi.to_crs(4326).total_bounds
+        region = (f"[BBOX]W{b[0]:.4f} N{b[3]:.4f} E{b[2]:.4f} S{b[1]:.4f}")
+    except Exception:
+        pass
+    coll = str(int(cfg["data"]["collection_version"]))
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    def get(params):
+        last = None
+        for attempt in range(cfg["data"]["retries"]):
+            try:
+                r = requests.get(url, params=params, timeout=(15, 90))
+                if 400 <= r.status_code < 500 and r.status_code != 429:
+                    raise RuntimeError(f"LAADS {prod}: HTTP {r.status_code}: "
+                                       f"{r.text[:300]}")
+                r.raise_for_status()
+                return r.json()
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last = e
+                time.sleep(min(30, 2 ** attempt))
+        raise RuntimeError(f"LAADS недоступен для {prod}: {last}")
+
+    queries = []
+    for y in years:
+        doys = needed_composites(cfg, prod, y)
+        if not doys:
+            continue
+        d0 = dt.date(y, 1, 1) + dt.timedelta(days=min(doys) - 1)
+        d1 = dt.date(y, 1, 1) + dt.timedelta(days=max(doys) - 1)
+        q = dict(products=prod, collections=coll,
+                 temporalRanges=f"{d0.isoformat()}..{d1.isoformat()}")
+        if region:
+            q["regions"] = region
+        queries.append(q)
+    pages = []
+    with cf.ThreadPoolExecutor(cfg["data"].get("search_workers", 6)) as ex:
+        firsts = list(ex.map(get, queries))
+        more = []
+        for q, js in zip(queries, firsts):
+            pages.append(js)
+            for k in range(2, int(js.get("n_pages") or 1) + 1):
+                more.append(dict(q, page=k))
+        pages += list(ex.map(get, more))
+    import gzip
+    with gzip.open(raw_dir / f"LAADS_{prod}_{min(years)}_{max(years)}.json.gz",
+                   "wt", encoding="utf-8") as fz:
+        json.dump(pages, fz)
+    items, seen = [], set()
+    for js in pages:
+        for it in js.get("content", []) or []:
+            name = it.get("name", "")
+            g = parse_granule_name(name)
+            if not g or g["tile"] not in tiles or name in seen:
+                continue
+            seen.add(name)
+            items.append(dict(product=prod, file=name,
+                              url=it.get("downloadsLink"),
+                              tile=g["tile"], year=g["year"], doy=g["doy"],
+                              production_time=g["ptime"],
+                              concept_id=f"LAADS:{it.get('fileId')}",
+                              collection_concept_id=f"LAADS:{prod}.{coll}",
+                              revision=it.get("mtime"),
+                              size_bytes=it.get("size"),
+                              checksum=it.get("md5sum"),
+                              checksum_algorithm="MD5" if it.get("md5sum")
+                              else None))
+    return items
+
+
+def earthdata_token(cfg) -> str:
+    """Токен Earthdata (Bearer) для LAADS: EARTHDATA_TOKEN, файл
+    .earthdata_token (в папке проекта или домашней), data.earthdata_token,
+    затем получение через earthaccess по логину/паролю, затем запрос."""
+    tok = os.environ.get("EARTHDATA_TOKEN")
+    if tok:
+        return tok.strip()
+    for p in (Path(cfg["project"]["root"]) / ".earthdata_token",
+              Path.home() / ".earthdata_token"):
+        if p.exists():
+            t = p.read_text(encoding="utf-8").strip()
+            if t:
+                return t
+    if cfg["data"].get("earthdata_token"):
+        return str(cfg["data"]["earthdata_token"]).strip()
+    try:
+        import earthaccess
+        for strategy in ("environment", "netrc"):
+            try:
+                auth = earthaccess.login(strategy=strategy, persist=False)
+                t = (getattr(auth, "token", None) or {}).get("access_token")
+                if t:
+                    LOG.info(f"Earthdata: токен получен ({strategy})")
+                    return t
+            except Exception:
+                continue
+    except ImportError:
+        pass
+    msg = ("Для LAADS DAAC нужен токен NASA Earthdata. Откройте "
+           "https://urs.earthdata.nasa.gov → Generate Token, скопируйте токен и "
+           "сохраните его в файл .earthdata_token в папке проекта (или задайте "
+           "переменную среды EARTHDATA_TOKEN).")
+    if sys.stdin is not None and sys.stdin.isatty() or in_notebook():
+        import getpass
+        LOG.warning(msg)
+        try:
+            t = getpass.getpass("Вставьте токен Earthdata (ввод скрыт): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            t = ""
+        if t:
+            p = Path(cfg["project"]["root"]) / ".earthdata_token"
+            p.write_text(t, encoding="utf-8")
+            LOG.info(f"Токен сохранён в {p}")
+            return t
+    raise RuntimeError(msg)
+
+
+def laads_session(cfg):
+    import requests
+    s = requests.Session()
+    s.headers["Authorization"] = f"Bearer {earthdata_token(cfg)}"
+    return s
 
 
 def local_granules(prj: Project) -> pd.DataFrame:
@@ -1002,16 +1198,23 @@ def run_inventory(prj: Project, online: bool = True) -> pd.DataFrame:
     years = prj.years
     rows = []
     if online and cfg["data"]["mode"] != "offline":
+        source = choose_source(cfg)
+        LOG.info(f"Источник гранул: {source}")
         for prod in cfg["data"]["products"]:
             t0 = time.time()
             # годовой продукт MOD44B: гранула A{year}065
             y_from = years[0]
             y_to = years[-1] + (1 if PRODUCTS[prod]["start_doy"] > 1 and
                                 PRODUCTS[prod]["cadence"] == "annual" else 0)
-            items = cmr_search(cfg, prod, tiles, y_from, y_to,
-                               prj.inv / "raw")
+            if source == "laads":
+                items = laads_search(cfg, prod, tiles,
+                                     list(range(y_from, y_to + 1)),
+                                     prj.inv / "raw")
+            else:
+                items = cmr_search(cfg, prod, tiles, y_from, y_to,
+                                   prj.inv / "raw")
             rows += items
-            LOG.info(f"CMR {prod}: найдено {len(items)} гранул "
+            LOG.info(f"{source.upper()} {prod}: найдено {len(items)} гранул "
                      f"({time.time()-t0:.0f} с)")
         cat = pd.DataFrame(rows)
     else:
@@ -1190,7 +1393,11 @@ def run_download(prj: Project):
     LOG.info(f"К загрузке: {len(todo)} из {len(cat)} гранул")
     if todo.empty:
         return reg
-    sess = earthdata_session()
+    hosts = todo["url"].astype(str)
+    sess_laads = laads_session(cfg) if hosts.str.contains("ladsweb").any() \
+        else None
+    sess_lp = earthdata_session() if (~hosts.str.contains("ladsweb")).any() \
+        else None
     bad = prj.raw / "_corrupt"
     bad.mkdir(exist_ok=True)
 
@@ -1207,19 +1414,24 @@ def run_download(prj: Project):
         part = dest.with_suffix(".part")
         for attempt in range(cfg["data"]["retries"]):
             try:
+                sess = sess_laads if "ladsweb" in str(r["url"]) else sess_lp
                 with sess.get(r["url"], stream=True,
                               timeout=cfg["data"]["timeout_s"]) as resp:
-                    if resp.status_code in (401, 403):
+                    if resp.status_code in (401, 403) or (
+                            "ladsweb" in str(r["url"]) and
+                            "text/html" in resp.headers.get("Content-Type", "")):
                         raise PermissionError(
-                            f"HTTP {resp.status_code}: проверьте доступ "
-                            "Earthdata/одобрение приложения LP DAAC")
+                            f"HTTP {resp.status_code}: проверьте токен/доступ "
+                            "Earthdata (для LAADS — действующий токен "
+                            "в .earthdata_token или EARTHDATA_TOKEN)")
                     resp.raise_for_status()
                     with open(part, "wb") as f:
                         for chunk in resp.iter_content(1 << 20):
                             f.write(chunk)
                 exp = r.get("size_bytes")
                 if exp and not pd.isna(exp) and abs(part.stat().st_size -
-                                                    float(exp)) > 1024:
+                                                    float(exp)) > max(
+                        2048, 0.002 * float(exp)):
                     raise IOError("размер файла не совпадает с каталогом")
                 ck = verify_checksum(part, r.get("checksum"),
                                      r.get("checksum_algorithm"))
