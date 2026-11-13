@@ -1,0 +1,6 @@
+# Реальная инвентаризация: европейская часть России (приближённый контур
+# Natural Earth 1:50m, обрезка по 60° в.д.), 2003–2024
+project: {name: european_russia_modis, root: .}
+inputs: {aoi: aoi_european_russia.gpkg}
+period: {start_year: 2003, end_year: 2024}
+data: {mode: online}

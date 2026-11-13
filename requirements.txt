@@ -1,0 +1,19 @@
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+rasterio>=1.3
+affine>=2.4
+geopandas>=0.14
+shapely>=2.0
+pyproj>=3.5
+pyyaml>=6.0
+requests>=2.31
+earthaccess>=0.9
+matplotlib>=3.7
+pyarrow>=14
+# Чтение HDF4 (MODIS). Если в вашей сборке GDAL есть драйвер HDF4,
+# pyhdf не обязателен. На Windows: pip install pyhdf (есть готовые колёса)
+# или conda install -c conda-forge pyhdf
+pyhdf>=0.11
+# для тестов
+pytest>=7
