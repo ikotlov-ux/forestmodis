@@ -571,3 +571,177 @@ def test_gee_prepare_skips_unpublished_years_and_purges_stale(tmp_path,
     miss = f.load_table(prj, "missing_product_years")
     assert set(miss["reason"]) == {"not_in_gee_catalog"}
 
+
+def test_gee_from_images_homogeneous_float_types():
+    """Строгая эмуляция ограниченных типов GEE (Float<0,7> vs Float<0,8> при
+    умножении маски на разное число дней перекрытия): все списки, передаваемые
+    в ee.ImageCollection.fromImages, обязаны иметь единый тип float32 и
+    одинаковые имена полос."""
+    import forestmodis as f
+    import sys, types
+
+    class _TypedImg:
+        def __init__(self, band="raw", ptype="Int<-32768,32767>"):
+            self.bands = [(band, ptype)]
+
+        def _with(self, ptype=None, band=None):
+            b, t = self.bands[0]
+            out = _TypedImg(band or b, ptype or t)
+            return out
+
+        def select(self, name):
+            return _TypedImg(name, "Int<-32768,32767>")
+
+        def mask(self):
+            return self._with(ptype="Float<0.0,1.0>")
+
+        def toFloat(self):
+            out = _TypedImg()
+            out.bands = [(b, "float32") for b, _ in self.bands]
+            return out
+
+        def multiply(self, x):
+            b, t = self.bands[0]
+            if t == "float32":
+                return self._with(ptype="float32")
+            return self._with(ptype=f"Bounded<{t}*{x}>")
+
+        def add(self, x):
+            b, t = self.bands[0]
+            return self._with(ptype="float32" if t == "float32" else f"Bounded<{t}+{x}>")
+
+        def divide(self, x):
+            return self._with(ptype="float32" if self.bands[0][1] == "float32" else f"Bounded<div:{x}>")
+
+        def rename(self, name):
+            return _TypedImg(name, self.bands[0][1])
+
+        def addBands(self, other):
+            out = _TypedImg()
+            out.bands = list(self.bands) + list(other.bands)
+            return out
+
+        def updateMask(self, _m):
+            return self
+
+        def unmask(self, val=0, same_fp=True):
+            b, t = self.bands[0]
+            return self._with(ptype=t if t == "float32" else f"Unmasked<{t},{val}>")
+
+        def resample(self, _mode):
+            return self
+
+        def reduceResolution(self, *_a, **_k):
+            return self
+
+        def reduce(self, _r):
+            return self
+
+        def max(self, *_a):
+            return self
+
+        def bitwiseAnd(self, _x):
+            return self._with(ptype="Int<0,255>")
+
+        def rightShift(self, _x):
+            return self._with(ptype="Int<0,255>")
+
+        def eq(self, _x):
+            return self._with(ptype="Int<0,1>")
+
+        def neq(self, _x):
+            return self._with(ptype="Int<0,1>")
+
+        def gt(self, _x):
+            return self._with(ptype="Int<0,1>")
+
+        def gte(self, _x):
+            return self._with(ptype="Int<0,1>")
+
+        def lte(self, _x):
+            return self._with(ptype="Int<0,1>")
+
+        def And(self, _x):
+            return self._with(ptype="Int<0,1>")
+
+        def Or(self, _x):
+            return self._with(ptype="Int<0,1>")
+
+    class _TypedCol:
+        def __init__(self, imgs=None):
+            self.imgs = imgs or [_TypedImg()]
+
+        @staticmethod
+        def fromImages(imgs):
+            assert len(imgs) > 0
+            sig0 = imgs[0].bands
+            for idx, im in enumerate(imgs):
+                assert im.bands == sig0, (
+                    f"Неоднородная коллекция на элементе {idx}: "
+                    f"{im.bands} != {sig0}")
+                for _, pt in im.bands:
+                    assert pt == "float32", f"Ограниченный тип полосы: {im.bands}"
+            return _TypedCol(imgs)
+
+        def filterDate(self, *_a):
+            return self
+
+        def first(self):
+            return _TypedImg()
+
+        def sum(self):
+            b, _ = self.imgs[0].bands[0]
+            return _TypedImg(b, "float32")
+
+        def mean(self):
+            b, _ = self.imgs[0].bands[0]
+            return _TypedImg(b, "float32")
+
+        def median(self):
+            b, _ = self.imgs[0].bands[0]
+            return _TypedImg(b, "float32")
+
+        def max(self):
+            b, _ = self.imgs[0].bands[0]
+            return _TypedImg(b, "float32")
+
+        def min(self):
+            b, _ = self.imgs[0].bands[0]
+            return _TypedImg(b, "float32")
+
+        def count(self):
+            b, _ = self.imgs[0].bands[0]
+            return _TypedImg(b, "Int<0,999>")
+
+        def reduce(self, _r):
+            b, _ = self.imgs[0].bands[0]
+            return _TypedImg(b, "float32")
+
+        def map(self, fn):
+            mapped = [fn(im) for im in self.imgs]
+            return _TypedCol.fromImages(mapped)
+
+    te = types.ModuleType("ee")
+    te.Image = lambda *_a, **_k: _TypedImg()
+    te.ImageCollection = _TypedCol
+    te.Reducer = SimpleNamespace(mean=lambda: None, percentile=lambda p: p)
+    sys.modules["ee"] = te
+    try:
+        cfg = copy.deepcopy(f.DEFAULT_CONFIG)
+        f.gee_accumulated(cfg, "MOD16A2GF", 2000, "growing",
+                          [("ET_500m", "et"), ("PET_500m", "pet")])
+        f.gee_accumulated(cfg, "MOD17A2HGF", 2021, "growing",
+                          [("Gpp_500m", "gpp")])
+        f.gee_state_stats(cfg, "MOD13Q1", 2000, "growing",
+                          [("250m 16 days EVI", "evi_terra"),
+                           ("250m 16 days NDVI", "ndvi_terra")],
+                          use_pixel_doy="250m 16 days composite day of the year")
+        f.gee_state_stats(cfg, "MCD15A2H", 2005, "growing",
+                          [("Lai_500m", "lai"), ("Fpar_500m", "fpar")])
+        f.gee_state_stats(cfg, "MOD11A2", 2005, "summer",
+                          [("LST_Day_1km", "lstday_terra")])
+        f.gee_burned(cfg, 2005)
+    finally:
+        del sys.modules["ee"]
+
+

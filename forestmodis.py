@@ -2454,16 +2454,16 @@ def gee_layer(prod, img, layer, profile):
         m = m.And(qm)
     if spec["kind"] in ("categorical", "doy", "event", "qa"):
         return raw.updateMask(m)
-    return raw.multiply(spec.get("scale", 1.0)).add(
-        spec.get("offset", 0.0)).updateMask(m)
+    return raw.toFloat().multiply(float(spec.get("scale", 1.0))).add(
+        float(spec.get("offset", 0.0))).updateMask(m).toFloat()
 
 
 def _gee_binary_mask(img):
     """Нормализует дробную маску (0..1) после reduceResolution / resample к
-    строгой 0/1, чтобы сезонные суммы, дни покрытия и перцентили не искажались
-    полупрозрачными граничными пикселями."""
+    строгой 0/1 и снимает ограниченные границы типа (Float<lo,hi> → float),
+    чтобы ee.ImageCollection.fromImages получал строго однородные полосы."""
     m = img.mask().gt(0)
-    return img.unmask(0, False).updateMask(m)
+    return img.toFloat().unmask(0.0, False).updateMask(m).toFloat()
 
 
 def gee_to_grid(prod, img, layer):
@@ -2536,18 +2536,18 @@ def gee_state_stats(cfg, prod, year, season_key, layer_specs,
             v = gee_layer(prod, img, layer, profile)
             if pix is not None:
                 v = v.updateMask(pix)
-            stacks[pref].append(gee_to_grid(prod, v, layer))
+            stacks[pref].append(gee_to_grid(prod, v, layer).toFloat())
     mincov = cfg["quality"]["min_season_coverage"]
     out, specs = None, []
     for layer, pref in layer_specs:
         col = ee.ImageCollection.fromImages(stacks[pref])
-        cov = col.count().divide(float(n_expected))
+        cov = col.count().divide(float(n_expected)).toFloat()
         ok = cov.gte(mincov)
         for k, im in (("mean", col.mean()), ("median", col.median()),
                       ("max", col.max()),
                       ("p10", col.reduce(ee.Reducer.percentile([10]))),
                       ("p90", col.reduce(ee.Reducer.percentile([90])))):
-            im = im.updateMask(ok).rename(f"{pref}_{season_key}_{k}")
+            im = im.updateMask(ok).toFloat().rename(f"{pref}_{season_key}_{k}")
             out = im if out is None else out.addBands(im)
             specs.append((f"{pref}_{season_key}_{k}", layer, k))
         covb = cov.rename(f"{pref}_{season_key}_coverage")
@@ -2578,18 +2578,23 @@ def gee_accumulated(cfg, prod, year, season_key, layers, catalog=None):
             v = gee_to_grid(prod, gee_layer(prod, img, layer, profile), layer)
             vals[layer] = v
             p = layer_map[layer]
-            sums[p].append(v.multiply(w))
-            days[p].append(v.mask().multiply(ov))
+            # Явный .toFloat(): без него v.mask().multiply(ov) даёт разные
+            # ограниченные типы Float<0,7> и Float<0,8> на краевых и полных
+            # 8-дневках, что ломает ee.ImageCollection.fromImages(...).
+            sums[p].append(v.multiply(float(w)).toFloat())
+            days[p].append(v.mask().multiply(float(ov)).toFloat())
         if "ET_500m" in vals and "PET_500m" in vals:
             both = vals["ET_500m"].mask().And(vals["PET_500m"].mask())
-            cet.append(vals["ET_500m"].updateMask(both).multiply(w))
-            cpet.append(vals["PET_500m"].updateMask(both).multiply(w))
+            cet.append(
+                vals["ET_500m"].updateMask(both).multiply(float(w)).toFloat())
+            cpet.append(
+                vals["PET_500m"].updateMask(both).multiply(float(w)).toFloat())
     mincov = cfg["quality"]["min_season_coverage"]
     out, specs = None, []
 
     def add(im, name, layer, stat):
         nonlocal out
-        im = im.rename(name)
+        im = im.toFloat().rename(name)
         out = im if out is None else out.addBands(im)
         specs.append((name, layer, stat))
 
@@ -2641,7 +2646,8 @@ def gee_gpp_annual(cfg, year, catalog=None):
     if img is None:
         return None
     raw = img.select("Gpp")
-    v = raw.multiply(1e-4).updateMask(raw.gte(0).And(raw.lte(32700)))
+    v = raw.toFloat().multiply(1e-4).updateMask(
+        raw.gte(0).And(raw.lte(65500))).toFloat()
     v = gee_to_grid("MOD17A2HGF", v, "Gpp_500m")
     return v.rename("gpp_annual_sum"), [("gpp_annual_sum", "Gpp", "annual_sum")], 1
 
@@ -2664,15 +2670,16 @@ def gee_burned(cfg, year, catalog=None):
         if profile == "strict":
             ok = ok.And(qa.rightShift(2).bitwiseAnd(1).eq(0))
         m = raw.gte(0).And(ok)
-        bds.append(raw.updateMask(m))
-        oks.append(m.unmask(0))
+        bds.append(raw.updateMask(m).toFloat().rename("bd"))
+        oks.append(m.unmask(0).toFloat().rename("ok"))
     if not bds:
         return None
     bdcol = ee.ImageCollection.fromImages(bds)
     okcol = ee.ImageCollection.fromImages(oks)
-    burned = (bdcol.map(lambda i: i.gt(0).unmask(0)).max()
-              .updateMask(okcol.max().gt(0)).rename("burned"))
-    doy = bdcol.map(lambda i: i.updateMask(i.gt(0))).min().rename("burn_doy")
+    burned = (bdcol.map(lambda i: i.gt(0).unmask(0).toFloat()).max()
+              .updateMask(okcol.max().gt(0)).toFloat().rename("burned"))
+    doy = (bdcol.map(lambda i: i.updateMask(i.gt(0)).toFloat()).min()
+           .toFloat().rename("burn_doy"))
     out = burned.addBands(doy)
     return out, [("burned", "Burn Date", "binary"),
                  ("burn_doy", "Burn Date", "first_doy")], 12
