@@ -2414,6 +2414,11 @@ def gee_to_grid(prod, img, layer):
                                                    "event"):
         return img                       # nearest (по умолчанию)
     if prod in GEE_250M:
+        # mosaic() оставляет изображение без нативной проекции — reduceResolution
+        # требует её явно ("does not have a valid default projection");
+        # задаём синусоидальную проекцию MODIS с нативным разрешением.
+        img = img.setDefaultProjection(
+            ee.Projection(SINU_WKT).atScale(PRODUCTS[prod]["native_res_m"]))
         return img.reduceResolution(ee.Reducer.mean(), maxPixels=1024)
     return img.resample("bilinear")
 
