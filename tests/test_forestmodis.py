@@ -362,7 +362,7 @@ def test_validate_config_gee():
 
 
 def test_gee_download_request_params(tmp_path, monkeypatch):
-    """filePerBand=False + правильный порядок crsTransform + region."""
+    """Fallback getDownloadURL: filePerBand=False + построчный crs_transform."""
     import forestmodis as f
     import sys, io, types
     import numpy as np
@@ -383,6 +383,9 @@ def test_gee_download_request_params(tmp_path, monkeypatch):
         def unmask(self, *a, **k):
             return self
 
+        def toFloat(self):
+            return self
+
         def getDownloadURL(self, params):
             return "http://fake/gee"
 
@@ -394,7 +397,8 @@ def test_gee_download_request_params(tmp_path, monkeypatch):
                            transform=from_origin(700000, 6000000, 500,
                                                  500)) as dst:
             dst.write(arr)
-        return SimpleNamespace(content=buf.getvalue(),
+        return SimpleNamespace(content=buf.getvalue(), ok=True, status_code=200,
+                               text="", reason="OK",
                                raise_for_status=lambda: None)
 
     calls = {}
@@ -418,11 +422,11 @@ def test_gee_download_request_params(tmp_path, monkeypatch):
         del sys.modules["ee"]
     p = calls["params"]
     assert p["filePerBand"] is False and p["format"] == "GEO_TIFF"
-    # ключ именно snake_case: camelCase-вариант библиотека ee молча
-    # отбрасывает, и сервер считает сетку в масштабе по умолчанию
     assert "crsTransform" not in p and "region" not in p
-    assert p["crs_transform"] == [500.0, 0, 0, -500.0, 700000, 6000000.0]
-    assert p["crs"] == f.gee_grid_crs(prj)
+    # В ee.Image.reproject порядок строго построчный:
+    # [xScale, xShear, xTranslate, yShear, yScale, yTranslate]
+    assert p["crs_transform"] == [500.0, 0.0, 700000.0, 0.0, -500.0, 6000000.0]
+    assert p["crs"] == "EPSG:32637"
     assert p["dimensions"] == [6, 4]
     out = f.annual_path(prj, "lc", 2003)
     assert out.exists()
@@ -430,3 +434,140 @@ def test_gee_download_request_params(tmp_path, monkeypatch):
         v = src.read(1)
     assert v.shape == (4, 6)
     assert st["lc"]["frac_valid"] == 1.0
+
+
+def test_gee_compute_pixels_and_albers_datum(tmp_path):
+    """Основной путь ee.data.computePixels + коррекция +ellps=WGS84 → WGS_1984."""
+    import forestmodis as f
+    import sys, io, types
+    import rasterio
+    from rasterio.transform import from_origin
+
+    legacy_albers = ("+proj=aea +lat_1=54.20 +lat_2=58.19 +lat_0=56.19 "
+                     "+lon_0=37.8 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs")
+    grid = f.Grid(crs=legacy_albers,
+                  transform=(500.0, 0.0, -479500.0, 0.0, -500.0, 355500.0),
+                  width=8, height=5, res=500.0,
+                  aoi_mask=np.ones((5, 8), bool), zones=None, zone_names={})
+    prj = SimpleNamespace(cfg=copy.deepcopy(f.DEFAULT_CONFIG),
+                          grid=lambda: grid, work=tmp_path)
+    wkt = f.gee_grid_crs(prj)
+    assert 'DATUM["WGS_1984"' in wkt and "Unknown" not in wkt
+
+    captured = {}
+
+    def _compute_pixels(req):
+        captured["req"] = req
+        arr = np.full((1, 5, 8), 42.0, dtype="float32")
+        buf = io.BytesIO()
+        with rasterio.open(buf, "w", driver="GTiff", height=5, width=8,
+                           count=1, dtype="float32",
+                           transform=from_origin(-479500.0, 355500.0,
+                                                 500.0, 500.0)) as dst:
+            dst.write(arr)
+        return buf.getvalue()
+
+    class _Img:
+        def select(self, *a, **k):
+            return self
+
+        def unmask(self, val, same_fp=True):
+            captured["unmask"] = (val, same_fp)
+            return self
+
+        def toFloat(self):
+            captured["to_float"] = True
+            return self
+
+    fake_ee = types.ModuleType("ee")
+    fake_ee.data = SimpleNamespace(computePixels=_compute_pixels)
+    sys.modules["ee"] = fake_ee
+    try:
+        st = f.gee_download(prj, "ptc", 2005, _Img(), [
+            ("ptc", "float32", np.nan, {}, "primary")])
+    finally:
+        del sys.modules["ee"]
+    req = captured["req"]
+    assert captured["unmask"] == (f.GEE_SENTINEL, False)
+    assert captured["to_float"] is True
+    assert req["fileFormat"] == "GEO_TIFF"
+    assert req["bandIds"] == ["ptc"]
+    g = req["grid"]
+    assert g["dimensions"] == {"width": 8, "height": 5}
+    assert g["affineTransform"] == {
+        "scaleX": 500.0, "shearX": 0.0, "translateX": -479500.0,
+        "shearY": 0.0, "scaleY": -500.0, "translateY": 355500.0,
+    }
+    assert g["crsWkt"] == wkt and "crsCode" not in g
+    assert np.isclose(st["ptc"]["mean"], 42.0)
+
+
+def test_gee_prepare_skips_unpublished_years_and_purges_stale(tmp_path,
+                                                              monkeypatch):
+    """Годы вне публикации каталога GEE пропускаются без падения и очищают
+    устаревшие пустые растры (например, lc_2000.tif)."""
+    import forestmodis as f
+    import sys, io
+    import datetime as dt
+    import rasterio
+    from rasterio.transform import from_origin
+
+    cfg = copy.deepcopy(f.DEFAULT_CONFIG)
+    cfg["project"]["root"] = str(tmp_path)
+    cfg["period"]["start_year"] = 2000
+    cfg["period"]["end_year"] = 2002
+    cfg["data"]["backend"] = "gee"
+    cfg["data"]["gee_project"] = "test-proj"
+    cfg["data"]["products"] = ["MCD12Q1", "MOD44B"]
+    cfg["data"]["fail_on_missing_required"] = True
+
+    grid = f.Grid(crs="EPSG:32637",
+                  transform=(500.0, 0.0, 500000.0, 0.0, -500.0, 6200000.0),
+                  width=4, height=4, res=500.0,
+                  aoi_mask=np.ones((4, 4), bool), zones=None, zone_names={})
+    prj = f.Project(cfg)
+    prj._grid = grid
+
+    # Создаём ложный пустой lc_2000.tif (все 255), как от старого прогона
+    stale_lc = f.annual_path(prj, "lc", 2000)
+    f.write_raster(stale_lc, np.full((4, 4), f.NODATA_U8, "uint8"), grid,
+                   nodata=f.NODATA_U8, dtype="uint8")
+    assert stale_lc.exists()
+
+    ts = lambda y, m, d: int(
+        dt.datetime(y, m, d, tzinfo=dt.timezone.utc).timestamp() * 1000)
+    fake_cat = {
+        "MCD12Q1": [(ts(2001, 1, 1), "MODIS/061/MCD12Q1/2001_01_01")],
+        "MOD44B": [(ts(2000, 3, 5), "MODIS/061/MOD44B/2000_03_05"),
+                   (ts(2001, 3, 6), "MODIS/061/MOD44B/2001_03_06")],
+    }
+    monkeypatch.setattr(f, "gee_init", lambda c: None)
+    monkeypatch.setattr(f, "gee_catalog_index", lambda prods, gpp_mode="annual": fake_cat)
+
+    def _compute_pixels(req):
+        val = 4.0 if req["bandIds"] == ["lc"] else 55.0
+        arr = np.full((1, 4, 4), val, dtype="float32")
+        buf = io.BytesIO()
+        with rasterio.open(buf, "w", driver="GTiff", height=4, width=4,
+                           count=1, dtype="float32",
+                           transform=from_origin(500000.0, 6200000.0,
+                                                 500.0, 500.0)) as dst:
+            dst.write(arr)
+        return buf.getvalue()
+
+    fake_ee = _fake_ee()
+    fake_ee.data = SimpleNamespace(computePixels=_compute_pixels)
+    sys.modules["ee"] = fake_ee
+    try:
+        res = f.stage_prepare_gee(prj)
+    finally:
+        del sys.modules["ee"]
+    assert res["backend"] == "gee"
+    assert not stale_lc.exists()
+    assert f.annual_path(prj, "lc", 2001).exists()
+    assert not f.annual_path(prj, "lc", 2002).exists()
+    assert f.annual_path(prj, "ptc", 2000).exists()
+    assert f.annual_path(prj, "ptc", 2001).exists()
+    miss = f.load_table(prj, "missing_product_years")
+    assert set(miss["reason"]) == {"not_in_gee_catalog"}
+
