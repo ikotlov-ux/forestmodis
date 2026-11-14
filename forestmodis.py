@@ -2381,7 +2381,12 @@ def gee_composite(prod, year, a, b):
     d1 = (dt.date(year, 1, 1) + dt.timedelta(days=b)).isoformat()
     col = ee.ImageCollection(g["asset"]).filterDate(d0, d1)
     empty = _gee_empty(list(g["bands"].values()))
-    return ee.Image(ee.Algorithms.If(col.size().gt(0), col.first(), empty))
+    # col.first() вернул бы ОДИН тайл MODIS (например, h19v03) — для AOI,
+    # пересекающей несколько тайлов, это усечённые данные и "дыры" на
+    # границах. mosaic() сшивает все тайлы периода; для продуктов с
+    # несколькими сценами за окно (MOD44B и др.) это ближайший аналог
+    # правила "первый гранул" NASA-бэкенда.
+    return ee.Image(ee.Algorithms.If(col.size().gt(0), col.mosaic(), empty))
 
 
 def gee_layer(prod, img, layer, profile):
