@@ -2632,9 +2632,13 @@ def gee_download(prj: Project, group: str, year: int, image, band_specs):
         bx1, by1 = x0 + c1 * res, y0 - r1 * res
         rect = ee.Geometry.Rectangle([bx0, by1, bx1, by0],
                                      proj=ee.Projection(wkt), geodesic=False)
+        # Многополосный GeoTIFF: filePerBand=False обязателен — при True
+        # Earth Engine игнорирует общие crs/crs_transform и возвращает
+        # каждый слой в нативной проекции (это давало ошибку
+        # "Pixel grid dimensions must be <= 32768").
         params = dict(bands=[{"id": n} for n in names], region=rect,
-                      crs=wkt, crsTransform=[res, 0, bx0, 0, -res, by0],
-                      format="GEO_TIFF")
+                      crs=wkt, crsTransform=[res, 0, 0, -res, bx0, by0],
+                      format="GEO_TIFF", filePerBand=False)
         last = None
         for attempt in range(5):
             try:

@@ -359,3 +359,69 @@ def test_validate_config_gee():
     cfg["data"]["products"] = ["MCD12Q1", "BADPROD"]
     with pytest.raises(f.ConfigError):
         f.validate_config(cfg)
+
+
+def test_gee_download_request_params(tmp_path, monkeypatch):
+    """filePerBand=False + правильный порядок crsTransform + region."""
+    import forestmodis as f
+    import sys, io, types
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+
+    grid = f.Grid(crs="EPSG:32637", transform=(500.0, 0, 700000, 0, -500.0,
+                                              6000000),
+                  width=6, height=4, res=500.0,
+                  aoi_mask=np.ones((4, 6), bool), zones=None, zone_names={})
+    prj = SimpleNamespace(cfg=copy.deepcopy(f.DEFAULT_CONFIG),
+                          grid=lambda: grid, work=tmp_path)
+
+    class _Img:
+        def select(self, *a, **k):
+            return self
+
+        def unmask(self, *a, **k):
+            return self
+
+        def getDownloadURL(self, params):
+            return "http://fake/gee"
+
+    def _fake_get(url, timeout=None):
+        arr = np.arange(6 * 4 * 2, dtype="float32").reshape(2, 4, 6)
+        buf = io.BytesIO()
+        with rasterio.open(buf, "w", driver="GTiff", height=4, width=6,
+                           count=2, dtype="float32",
+                           transform=from_origin(700000, 6000000, 500,
+                                                 500)) as dst:
+            dst.write(arr)
+        return SimpleNamespace(content=buf.getvalue(),
+                               raise_for_status=lambda: None)
+
+    calls = {}
+
+    class _RecImg(_Img):
+        def getDownloadURL(self, params):
+            calls["params"] = params
+            return "http://fake/gee"
+
+    import requests as _rq
+    monkeypatch.setattr(_rq, "get", _fake_get)
+    fake_ee = types.ModuleType("ee")
+    fake_ee.Geometry = SimpleNamespace(Rectangle=lambda *a, **k: k)
+    fake_ee.Projection = lambda wkt: wkt
+    sys.modules["ee"] = fake_ee
+    try:
+        st = f.gee_download(prj, "lc", 2003, _RecImg(), [
+            ("lc", "float32", np.nan, {}, "primary"),
+            ("x", "float32", np.nan, {}, None)])
+    finally:
+        del sys.modules["ee"]
+    p = calls["params"]
+    assert p["filePerBand"] is False and p["format"] == "GEO_TIFF"
+    assert p["crsTransform"] == [500.0, 0, 0, -500.0, 700000, 6000000.0]
+    out = f.annual_path(prj, "lc", 2003)
+    assert out.exists()
+    with rasterio.open(out) as src:
+        v = src.read(1)
+    assert v.shape == (4, 6)
+    assert st["lc"]["frac_valid"] == 1.0
