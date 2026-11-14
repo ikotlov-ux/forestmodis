@@ -2652,9 +2652,18 @@ def gee_gpp_annual(cfg, year, catalog=None):
     return v.rename("gpp_annual_sum"), [("gpp_annual_sum", "Gpp", "annual_sum")], 1
 
 
-def gee_burned(cfg, year, catalog=None):
+def gee_burned(cfg, year, catalog=None, min_months: int = 6):
     """Выгорание за год: burned (0/1, 255=нет данных) и DOY первого пожара
-    (MCD64A1, месячные композиты, QA как qa_mcd64)."""
+    (MCD64A1, месячные композиты, QA как qa_mcd64).
+
+    В GEE-коллекции MODIS/061/MCD64A1 негоревшие пиксели суши (BurnDate == 0)
+    скрыты маской в полосе BurnDate, тогда как полоса QA не маскирована и
+    содержит флаги суши (бит 0 = 1) и достаточности данных (бит 1 = 1).
+    Поэтому BurnDate предварительно размаскируется нулём (.unmask(0)) перед
+    наложением маски валидной суши QA. Неполный стартовый год запуска
+    коллекции (< min_months месяцев, например ноябрь–декабрь 2000 г.)
+    возвращает None, чтобы не формировать ложный нулевой год без сезона пожаров.
+    """
     import ee
     profile = cfg["quality"]["profile"]
     bds, oks = [], []
@@ -2663,7 +2672,7 @@ def gee_burned(cfg, year, catalog=None):
         img = gee_composite("MCD64A1", year, a, b, catalog=catalog)
         if img is None:
             continue
-        raw = img.select("BurnDate")
+        raw = img.select("BurnDate").unmask(0)
         qa = img.select("QA")
         ok = qa.bitwiseAnd(1).eq(1).And(
             qa.rightShift(1).bitwiseAnd(1).eq(1))
@@ -2672,7 +2681,7 @@ def gee_burned(cfg, year, catalog=None):
         m = raw.gte(0).And(ok)
         bds.append(raw.updateMask(m).toFloat().rename("bd"))
         oks.append(m.unmask(0).toFloat().rename("ok"))
-    if not bds:
+    if len(bds) < min_months:
         return None
     bdcol = ee.ImageCollection.fromImages(bds)
     okcol = ee.ImageCollection.fromImages(oks)
@@ -3095,6 +3104,15 @@ def stage_prepare_gee(prj: Project):
                     else:
                         missing.append((prod, y, "no_valid_pixels_in_aoi"))
         if "MCD64A1" in prods:
+            bp_y = annual_path(prj, "burned", y)
+            if bp_y.exists():
+                try:
+                    import rasterio as _rio
+                    with _rio.open(bp_y) as _src:
+                        if _src.tags().get("unburned_zero") != "true":
+                            purge_bands(["burned", "burn_doy"], y, "burned")
+                except Exception:
+                    purge_bands(["burned", "burn_doy"], y, "burned")
             nl_b = sum(1 for st in composite_starts("MCD64A1", y)
                        if gee_composite("MCD64A1", y,
                                         *composite_interval("MCD64A1", y, st),
@@ -3104,6 +3122,8 @@ def stage_prepare_gee(prj: Project):
                 purge_bands(["burned", "burn_doy"], y, "burned")
                 missing.append(("MCD64A1", y, "not_in_gee_catalog"))
             elif emit("burned", y, r[0], r[1], r[2], "MCD64A1", ["burned"],
+                      extra={"unburned_zero": "true",
+                             "months_available": str(nl_b)},
                       n_loaded=nl_b):
                 valid_years["MCD64A1"] += 1
             else:
@@ -3544,7 +3564,7 @@ def stage_treecover(prj: Project):
            for n in names}
     paths = [annual_path(prj, "ptc", y) for y in yrs]
     bpaths = [annual_path(prj, "burned", y) for y in yrs]
-    has_fire = all(p.exists() for p in bpaths)
+    has_fire = any(p.exists() for p in bpaths)
     for r0, r1 in iter_row_blocks(grid.height, cfg["execution"]["block_rows"]):
         S = read_stack(paths, r0, r1, grid.width)
         T, h, w = S.shape
@@ -3590,7 +3610,10 @@ def stage_treecover(prj: Project):
                 sel = has_ev & (ev["event_year"] == y)
                 if sel.any():
                     win = B[max(0, k - 1):k + 1][:, sel]
-                    firec[sel] = (np.nansum(win, 0) > 0).astype("float32")
+                    valid_win = np.any(np.isfinite(win), 0)
+                    firec[sel] = np.where(
+                        valid_win, (np.nansum(win, 0) > 0).astype("float32"),
+                        np.nan)
         vals = dict(mean=mean, median=med, change_vs_baseline_pp=chg,
                     relative_change_pct=rel, sen_slope_pp_per_year=sl, mk_p=p,
                     n_valid=nv.astype("float32"), min=mn, min_year=minyr,

@@ -745,3 +745,68 @@ def test_gee_from_images_homogeneous_float_types():
         del sys.modules["ee"]
 
 
+def test_gee_burned_unmasks_zero_and_skips_partial_2000():
+    """MCD64A1 в GEE: (1) полоса BurnDate размаскируется нулём (.unmask(0)),
+    чтобы негоревшая валидная суша получала 0, а не 255; (2) 2000 г., где в
+    архиве есть только ноябрь–декабрь (2 мес. < 6), возвращает None."""
+    import forestmodis as f
+    import datetime as dt, sys, types
+
+    unmask_calls = []
+
+    class _Img:
+        def __init__(self, name="raw"):
+            self.name = name
+
+        def select(self, b):
+            return _Img(b)
+
+        def unmask(self, val=0, *_a):
+            unmask_calls.append((self.name, val))
+            return self
+
+        def bitwiseAnd(self, *_a): return self
+        def rightShift(self, *_a): return self
+        def eq(self, *_a): return self
+        def gt(self, *_a): return self
+        def gte(self, *_a): return self
+        def And(self, *_a): return self
+        def updateMask(self, *_a): return self
+        def toFloat(self): return self
+        def rename(self, n): return _Img(n)
+        def addBands(self, *_a): return self
+
+    class _Col:
+        def __init__(self, imgs): self.imgs = imgs
+        @staticmethod
+        def fromImages(imgs): return _Col(imgs)
+        def map(self, fn): return _Col([fn(i) for i in self.imgs])
+        def max(self): return _Img("max")
+        def min(self): return _Img("min")
+
+    te = types.ModuleType("ee")
+    te.Image = lambda _id: _Img(_id)
+    te.ImageCollection = _Col
+    sys.modules["ee"] = te
+    try:
+        cfg = copy.deepcopy(f.DEFAULT_CONFIG)
+        t_nov = int(dt.datetime(2000, 11, 1, tzinfo=dt.timezone.utc).timestamp() * 1000)
+        t_dec = int(dt.datetime(2000, 12, 1, tzinfo=dt.timezone.utc).timestamp() * 1000)
+        cat_2000 = {"MCD64A1": [(t_nov, "MODIS/061/MCD64A1/2000_11_01"),
+                                (t_dec, "MODIS/061/MCD64A1/2000_12_01")]}
+        assert f.gee_burned(cfg, 2000, catalog=cat_2000) is None
+
+        unmask_calls.clear()
+        cat_2001 = {"MCD64A1": [
+            (int(dt.datetime(2001, m, 1, tzinfo=dt.timezone.utc).timestamp() * 1000),
+             f"MODIS/061/MCD64A1/2001_{m:02d}_01")
+            for m in range(1, 13)
+        ]}
+        res = f.gee_burned(cfg, 2001, catalog=cat_2001)
+        assert res is not None
+        assert ("BurnDate", 0) in unmask_calls
+    finally:
+        del sys.modules["ee"]
+
+
+
