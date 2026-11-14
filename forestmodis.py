@@ -2629,17 +2629,14 @@ def gee_download(prj: Project, group: str, year: int, image, band_specs):
         if bf.exists():
             return
         bx0, by0 = x0 + c0 * res, y0 - r0 * res
-        bx1, by1 = x0 + c1 * res, y0 - r1 * res
-        rect = ee.Geometry.Rectangle([bx0, by1, bx1, by0],
-                                     proj=ee.Projection(wkt), geodesic=False)
-        # Ключ именно crs_transform (snake_case): клиентская библиотека ee
-        # извлекает из параметров только snake_case-ключи, вариант
-        # crsTransform молча отбрасывается, из-за чего сервер считал сетку
-        # в масштабе по умолчанию и падал с "Pixel grid dimensions
-        # must be <= 32768". filePerBand=False — один многополосный
-        # GeoTIFF с общей проекцией.
-        params = dict(bands=[{"id": n} for n in names], region=rect,
+        # Точный прямоугольник в точной проекции: crs + crs_transform +
+        # dimensions (без region). Раньше передавали ee.Geometry.Rectangle
+        # как region — сервер пересекал его с нативной (синусоидальной)
+        # проекцией MODIS, из-за чего блок приходил усечённым
+        # (5 строк вместо 1327).
+        params = dict(bands=[{"id": n} for n in names],
                       crs=wkt, crs_transform=[res, 0, 0, -res, bx0, by0],
+                      dimensions=[c1 - c0, r1 - r0],
                       format="GEO_TIFF", filePerBand=False)
         last = None
         for attempt in range(5):

@@ -420,9 +420,10 @@ def test_gee_download_request_params(tmp_path, monkeypatch):
     assert p["filePerBand"] is False and p["format"] == "GEO_TIFF"
     # ключ именно snake_case: camelCase-вариант библиотека ee молча
     # отбрасывает, и сервер считает сетку в масштабе по умолчанию
-    assert "crsTransform" not in p
+    assert "crsTransform" not in p and "region" not in p
     assert p["crs_transform"] == [500.0, 0, 0, -500.0, 700000, 6000000.0]
     assert p["crs"] == f.gee_grid_crs(prj)
+    assert p["dimensions"] == [6, 4]
     out = f.annual_path(prj, "lc", 2003)
     assert out.exists()
     with rasterio.open(out) as src:
