@@ -61,6 +61,16 @@ LOG = logging.getLogger("forestmodis")
 # =============================================================================
 SINU_WKT = ("+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R=6371007.181 "
             "+units=m +no_defs")
+SINU_WKT_GEE = ("PROJCS[\"unknown\",GEOGCS[\"unknown\",DATUM[\"unknown\","
+                "SPHEROID[\"unknown\",6371007.181,0]],"
+                "PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],"
+                "UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]]],"
+                "PROJECTION[\"Sinusoidal\"],"
+                "PARAMETER[\"longitude_of_center\",0],"
+                "PARAMETER[\"false_easting\",0],"
+                "PARAMETER[\"false_northing\",0],"
+                "UNIT[\"metre\",1,AUTHORITY[\"EPSG\",\"9001\"]],"
+                "AXIS[\"Easting\",EAST],AXIS[\"Northing\",NORTH]]")
 TILE_SIZE_M = 1111950.5196666666
 SINU_X0 = -20015109.355798
 SINU_Y0 = 10007554.677899
@@ -2418,7 +2428,7 @@ def gee_to_grid(prod, img, layer):
         # требует её явно ("does not have a valid default projection");
         # задаём синусоидальную проекцию MODIS с нативным разрешением.
         img = img.setDefaultProjection(
-            ee.Projection(SINU_WKT).atScale(PRODUCTS[prod]["native_res_m"]))
+            ee.Projection(SINU_WKT_GEE).atScale(PRODUCTS[prod]["native_res_m"]))
         return img.reduceResolution(ee.Reducer.mean(), maxPixels=1024)
     return img.resample("bilinear")
 
