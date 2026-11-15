@@ -5230,6 +5230,20 @@ probability of forest loss. Independent accuracy assessment:
 """
 
 
+def _df_to_markdown(df: pd.DataFrame) -> str:
+    """Форматирует DataFrame в Markdown pipe-таблицу без внешней зависимости
+    tabulate (pandas.DataFrame.to_markdown падает с ImportError без tabulate)."""
+    cols = [str(c) for c in df.columns]
+    head = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join("---" for _ in cols) + " |"
+    body = [
+        "| " + " | ".join("" if pd.isna(v) else str(v).replace("|", "\\|")
+                          for v in row) + " |"
+        for row in df.itertuples(index=False, name=None)
+    ]
+    return "\n".join([head, sep] + body)
+
+
 def stage_export(prj: Project):
     cfg = prj.cfg
     pkg = prj.pkg
@@ -5306,13 +5320,14 @@ def stage_export(prj: Project):
     miss = load_table(prj, "missing_product_years")
     lines = ["# Качество данных и ограничения", ""]
     if miss is not None and len(miss):
-        lines += ["## Отсутствующие продукт-годы", "",
-                  miss.drop(columns=["run_id", "result_id"], errors="ignore")
-                  .to_markdown(index=False) if hasattr(miss, "to_markdown")
-                  else miss.to_string(index=False), ""]
-    if q is not None and len(q) and "valid_fraction" in q:
-        lo = q[q.valid_fraction < 0.5]
-        lines += [f"Годовых слоёв с долей валидных ячеек < 0.5: {len(lo)} из "
+        mdf = miss.drop(columns=["run_id", "result_id"], errors="ignore")
+        lines += ["## Отсутствующие продукт-годы", "", _df_to_markdown(mdf), ""]
+    cov_col = ("mean_coverage" if (q is not None and "mean_coverage" in q)
+               else "valid_fraction" if (q is not None and "valid_fraction" in q)
+               else None)
+    if q is not None and len(q) and cov_col:
+        lo = q[q[cov_col] < 0.5]
+        lines += [f"Годовых слоёв со средним покрытием < 0.5: {len(lo)} из "
                   f"{len(q)}.", ""]
     lines += [
         "## Методические ограничения", "",

@@ -809,4 +809,16 @@ def test_gee_burned_unmasks_zero_and_skips_partial_2000():
         del sys.modules["ee"]
 
 
+def test_df_to_markdown_without_tabulate():
+    """Экспорт таблиц в Markdown не должен зависеть от пакета tabulate."""
+    import forestmodis as f
+    import pandas as pd
+    df = pd.DataFrame([{"product": "MCD12Q1", "year": 2000,
+                        "reason": "not_in_gee_catalog"}])
+    md = f._df_to_markdown(df)
+    assert "| product | year | reason |" in md
+    assert "| MCD12Q1 | 2000 | not_in_gee_catalog |" in md
+
+
+
 
